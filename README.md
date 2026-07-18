@@ -6,8 +6,6 @@
 
 ## The Problem
 
-You speak in fragments. Your agent responds in essays. The back-and-forth is slow.
-
 | This... | ...is tiring |
 |---------|-------------|
 | "um so like the docker thing I was talking about earlier? the error?" | → You have to clarify 3 times |
@@ -67,26 +65,9 @@ All visible. All editable before sending. No TTS required — this is about mean
 
 ---
 
-## Platforms
-
-| Platform | Where it lives | What you see |
-|----------|---------------|--------------|
-| **WebUI** | Two-pane composer + sidebar | Raw + refined text; progress updates during agent response |
-| **Discord** | Text channel messages (edit pattern) | Transcribed → refined → progress → final, all in text |
-| **CLI/TUI** | Status line + transcript | Quick progress indicators, refined text before send |
-
----
-
 ## Architecture
 
-This is a **hermes-agent plugin** that registers pipeline middleware:
-
-- **`pre_gateway_dispatch`** — intercept incoming messages, refine them
-- **`pre_llm_call`** — inject steering messages if drift detected
-- **`post_llm_call`** — distill the response, surface progress
-- **`agent.steer()`** — correct the agent mid-turn (existing mechanism)
-
-Plus a **WebUI extension** for the browser UI.
+This is a **hermes-agent plugin** that registers pipeline middleware, plus a **WebUI extension** for the browser UI.
 
 ```
 hermes-agent                      hermes-webui
@@ -106,6 +87,45 @@ hermes-agent                      hermes-webui
 │  └───────────────┘  │                                │
 └─────────────────────┘
 ```
+
+### Three Engines
+
+| Engine | Input | Output | Latency |
+|--------|-------|--------|---------|
+| **Refine** | Raw user text + conversation context | Structured, actionable prompt | < 500ms |
+| **Distill** | Streaming agent tokens + user intent | Natural progress updates (1-2s cadence) | Concurrent |
+| **Steer** | Streaming output + intent baseline | null (aligned) \| correction injection | < 1s |
+
+### Steering: Uses Existing `agent.steer()`
+
+The intermediary does NOT reinvent steering. Hermes already has `agent.steer(text)` which injects into the next tool result without interrupting. The intermediary hooks into this:
+
+```python
+# Detect drift → inject correction (non-interrupting)
+agent.steer("Stay focused on fixing the bug")
+# → Next tool result gets "User guidance: Stay focused on fixing the bug"
+# → Agent adjusts course without interruption
+```
+
+### Audio Sublayer: Pluggable from Day One
+
+| Backend | What it does | When to use |
+|---------|-------------|-------------|
+| **TEN Turn Detection** | Yield-floor detection (open-source) | Knowing *when* to speak |
+| **Pipecat Pipeline** | Concurrent STT+LLM+TTS | True full-duplex |
+| **LiveKit Transport** | WebRTC for browser voice | WebUI voice |
+
+Swap via config: `audio.backend: ten` → `audio.backend: pipecat`, no code changes.
+
+---
+
+## Platforms
+
+| Platform | Where it lives | What you see |
+|----------|---------------|--------------|
+| **WebUI** | Two-pane composer + sidebar | Raw + refined text; progress updates during agent response |
+| **Discord** | Text channel messages (edit pattern) | Transcribed → refined → progress → final, all in text |
+| **CLI/TUI** | Status line + transcript | Quick progress indicators, refined text before send |
 
 ---
 

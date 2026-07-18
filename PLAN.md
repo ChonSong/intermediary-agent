@@ -1,146 +1,68 @@
 # Intermediary Agent — Complete Plan
 
-## Vision
+## DeepThink Analysis
 
-A semantic supervisor that sits between the human and Hermes. It **refines** messy input, **distills** verbose output into natural progress updates, and **steers** the agent back on track by hooking into the existing `agent.steer()` mechanism. Includes a pluggable full-duplex audio layer for future voice use.
+### Loop 1 — Surface
+**Problem**: Design a semantic supervisor that sits between human and AI agent.
 
-## Problem Statement
+**Initial hypothesis**: Build a plugin with 3 engines (refine/distill/steer), hook into existing hermes-agent pipeline, add WebUI extension. Reuse `agent.steer()` for corrections. Audio as pluggable sublayer using TEN/Pipecat/LiveKit.
 
-| Friction | Example | Cost |
-|----------|---------|------|
-| Input friction | "um the docker thing?" requires 3 clarifications | Time, frustration |
-| Output friction | Agent gives 5-paragraph essay when user wants the command | User gives up reading |
-| Drift friction | Agent explains Docker history instead of fixing the bug | User must interrupt and restart |
-| Voice friction | Existing voice mode is half-duplex (can't hear while speaking) | Robotic conversation |
+### Loop 2 — Explore
+**Existing skills/knowledge discovered**:
+- `agent-pipeline-intermediary` skill — exact same problem, with reference implementations for hermes-agent integration and WebUI extension
+- `Playwright (Automation + MCP + Scraper)` — supports video recording of browser tests (frontend evidence)
+- `deep-think` — empirical validation is mandatory for running systems
 
-Existing frameworks (Pipecat/LiveKit/TEN) solve *audio transport* but not *semantic supervision*. This repo solves both: an intermediary for meaning, with a plug-in layer for full-duplex audio when needed.
+**Integration patterns from skill**:
+- `intermediate_state.py`: Per-session state management
+- `hooks.py`: Pre-gateway dispatch, pre-LLM call, post-LLM call hook registration
+- `discord_surface.py`: Edit-message pattern for progress updates
+- `webui_extension/intermediary.js`: SSE consumer for real-time intermediary events
 
----
+**Audio frameworks**:
+- TEN Turn Detection (open-source, best for turn-taking) — https://github.com/ten-framework/ten-framework
+- Pipecat (BSD-2, concurrent STT+LLM+TTS) — https://github.com/pipecat-ai/pipecat
+- LiveKit (Apache-2, WebRTC browser voice) — https://github.com/livekit/agents
 
-## Architecture
+### Loop 3 — Challenge
+**What could be wrong with the current approach?**
 
-### Layered Design
+1. **Steering via `agent.steer()` may not work as expected**
+   - The existing `/steer` is a USER command. Intermediary-side injection may require direct `agent._pending_steer` manipulation.
+   - Need to verify: Can a plugin call `agent.steer()` or does it need `ctx.inject_message()`?
+   - Actually: `ctx.inject_message()` INTERRUPTS. `agent.steer()` does NOT interrupt. We want non-interrupting.
+   - Resolution: Plugin should call `agent.steer()` if accessible, else use `ctx.inject_message()` with `role="user"` and rely on the agent's built-in steer queue.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         HERMES AGENT                                   │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    INTERMEDIARY PLUGIN                           │   │
-│  │                                                                  │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐ │   │
-│  │  │   Refine     │  │   Distill    │  │   Steer              │ │   │
-│  │  │   Engine     │  │   Engine     │  │   Engine             │ │   │
-│  │  │              │  │              │  │                      │ │   │
-│  │  │ STT → refine │  │ buffer →     │  │ detect drift →      │ │   │
-│  │  │ → structured │  │ summarize →  │  │ call agent.steer()  │ │   │
-│  │  │   prompt     │  │ progress msg │  │ (NON-interrupting)   │ │   │
-│  │  └──────────────┘  └──────────────┘  └──────────────────────┘ │   │
-│  │          │                  │                    │              │   │
-│  │  ┌───────┴──────────────────┴────────────────────┴───────────┐ │   │
-│  │  │                   State Manager                           │ │   │
-│  │  │  • intent_history (pronoun resolution)                    │ │   │
-│  │  │  • drift_baseline (what user asked for)                   │ │   │
-│  │  │  • steer_queue (pending corrections)                      │ │   │
-│  │  └──────────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │              AUDIO SUBLAYER (pluggable)                          │   │
-│  │                                                                  │   │
-│  │  ┌────────────────┐  ┌────────────────┐  ┌──────────────────┐ │   │
-│  │  │   TEN Turn     │  │   Pipecat      │  │   LiveKit        │ │   │
-│  │  │   Detection    │  │   Pipeline     │  │   Transport      │ │   │
-│  │  │                │  │                │  │                  │ │   │
-│  │  │ Yield-floor    │  │ STT+LLM+TTS    │  │ WebRTC for       │ │   │
-│  │  │ detection      │  │ concurrent     │  │ browser voice    │ │   │
-│  │  │ (open-source)  │  │ (open-source)  │  │ (heavy)          │ │   │
-│  │  └────────────────┘  └────────────────┘  └──────────────────┘ │   │
-│  │                                                                  │   │
-│  │  Barge-in: user speaks → agent's TTS stops → back to listening │   │
-│  │  Turn-taking: agent knows when to yield the floor               │   │
-│  │  Echo cancelation: agent doesn't hear its own output            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    Hermes Core (existing)                        │   │
-│  │  • agent.steer() — inject into next tool result (no interrupt)  │   │
-│  │  • inject_message() — interrupt and inject                       │   │
-│  │  • VoiceReceiver — Discord voice capture                         │   │
-│  │  • transcription_tools — STT providers                           │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+2. **Audio backends may be overkill for MVP**
+   - Phase 1 is text-only. Audio can come later.
+   - BUT: architecture must NOT preclude audio. The `AudioBackend` base class + configuration pattern is correct.
 
-### Key Difference from Earlier Plan
+3. **Refine/distill/steer each require LLM calls — latency triple?**
+   - Mitigation: Each engine is small/fast. Refine = single call (user waits). Distill = concurrent with agent. Steer = concurrent with agent.
+   - Total added latency: < 500ms for refine. Distill/steer are concurrent (0 added latency).
 
-**Before**: Steering used `inject_message()` (interrupts agent). Audio was an afterthought.
+4. **Existing hermes-agent `VALID_HOOKS` may not support what we need**
+   - Need to check if `intermediary_*` hooks need to be added, or if we reuse `pre_gateway_dispatch` + `pre_llm_call` + `post_llm_call`.
+   - The `pre_gateway_dispatch` hook gets `event: MessageEvent` BEFORE agent dispatch — perfect for refine.
+   - The `pre_llm_call` hook gets `messages` list — can inject steering.
+   - The `post_llm_call` hook gets `response` — can trigger distillation.
+   - Verdict: NO new hooks needed for Phase 1. Add `intermediary_*` hooks only for external observability.
 
-**Now**: Steering hooks into `agent.steer()` (injects into next tool result without interrupting). Audio is a pluggable sublayer from day one.
+### Loop 4 — Synthesize
+**Final architecture**:
 
----
+| Component | Mechanism | Existing/New |
+|-----------|-----------|--------------|
+| Refine engine | `pre_gateway_dispatch` hook → rewrite `event.text` | Existing hook, new handler |
+| Distill engine | `post_llm_call` hook → distill response | Existing hook, new handler |
+| Steer engine | `pre_llm_call` hook → inject into messages (via `agent.steer()` if accessible, else `ctx.inject_message()`) | Existing hook, new handler |
+| State manager | Per-session `IntermediaryState` | New |
+| Discord surface | Edit-message pattern using `DiscordAdapter.edit_message()` | Existing method |
+| WebUI surface | SSE endpoint `/api/intermediary/stream` + two-pane composer | New |
+| Audio sublayer | `AudioBackend` ABC with TEN/Pipecat/LiveKit implementations | New |
 
-## Hermes-Agent Hook Integration
-
-### Using Existing `/steer` Mechanism
-
-The intermediary must NOT reinvent steering. Existing mechanism:
-
-```python
-# In AIAgent (agent/aiagent.py or similar)
-class AIAgent:
-    def steer(self, text: str) -> bool:
-        """Store steer text. Next tool result will include 'User guidance: <text>'."""
-        with self._pending_steer_lock:
-            if self._pending_steer is None:
-                self._pending_steer = text
-            else:
-                self._pending_steer += f"\n{text}"
-        return True
-    
-    def _drain_pending_steer(self):
-        """Called by agent loop after tool results are collected."""
-        with self._pending_steer_lock:
-            text = self._pending_steer
-            self._pending_steer = None
-            return text
-```
-
-The intermediary's steer engine calls `agent.steer("Stay focused on fixing the bug")`. The agent's next tool result gets `User guidance: Stay focused on fixing the bug` appended. No interruption.
-
-### Plugin Hooks Needed
-
-```python
-# In hermes_cli/plugins.py VALID_HOOKS, add:
-VALID_HOOKS: Set[str] = {
-    # ... existing hooks ...
-    
-    # Intermediary lifecycle
-    "intermediary_refined",      # after intermediary refines input
-    "intermediary_distilled",    # after intermediary distills output
-    "intermediary_steered",      # after intermediary injects steering
-}
-```
-
-### PluginContext Additions
-
-```python
-# In hermes_cli/plugins.py PluginContext:
-class PluginContext:
-    # ... existing methods ...
-    
-    def get_cached_agent(self, session_id: str) -> Optional[AIAgent]:
-        """Get cached AIAgent for steer injection (gateway mode)."""
-        # Access SESSION_AGENT_CACHE from api.config (webui) or equivalent
-        ...
-    
-    def steer_agent(self, session_id: str, text: str) -> bool:
-        """Call agent.steer() without interrupting the agent."""
-        agent = self.get_cached_agent(session_id)
-        if agent and hasattr(agent, 'steer'):
-            return agent.steer(text)
-        return False
-```
+### Loop 5 — Convergence
+**Stable**: Yes. Architecture reuses existing hooks, doesn't reinvent steering, pluggable audio, text-first MVP.
 
 ---
 
@@ -148,25 +70,146 @@ class PluginContext:
 
 ### 1. Refine Engine (`intermediary/refine.py`)
 
-- Input: raw transcript + conversation context (intent_history)
-- Output: structured, actionable prompt
-- Quick: small model, single LLM call (<500ms target)
-- Handles pronoun resolution ("that thing", "what we discussed")
+```python
+class RefineEngine:
+    """Restructure messy user input into actionable prompts."""
+    
+    async def refine(self, raw_text: str, state: IntermediaryState, context: dict) -> str:
+        """
+        Args:
+            raw_text: User's raw transcript or typed text
+            state: Per-session state (intent_history for pronoun resolution)
+            context: Additional context (platform, conversation history)
+        
+        Returns:
+            Refined, actionable prompt
+        """
+        # 1. Resolve pronouns using intent_history
+        # 2. Expand vague references
+        # 3. Structure as [Action] + [Context] + [Constraints]
+        # 4. Single LLM call with small model
+        pass
+```
+
+**Prompt** (`prompts/refine_system.md`):
+```
+You are an input refinement engine. Restructure messy spoken/typed input into
+a clear, actionable prompt for an AI agent.
+
+Rules:
+1. Preserve the user's original intent exactly
+2. Resolve pronouns using conversation context
+3. Expand vague references ("that thing", "the error") to specific terms
+4. Structure as: [Action] + [Context] + [Constraints]
+5. If the user asks a question, keep it as a question
+6. If the user makes a request, phrase it as a direct instruction
+7. Output ONLY the refined prompt. No preamble, no explanation.
+
+Conversation context: {intent_history}
+Raw input: {raw_input}
+```
 
 ### 2. Distill Engine (`intermediary/distill.py`)
 
-- Input: streaming tokens from agent (via hook)
-- Output: natural progress updates (1 sentence)
-- Buffer tokens, detect milestones (topic shifts, completions)
-- Non-blocking: runs concurrently with agent output
+```python
+class DistillEngine:
+    """Watch agent's streaming output and produce natural progress updates."""
+    
+    def __init__(self):
+        self.buffer = ""
+        self.last_update = time.monotonic()
+    
+    async def on_token(self, token: str, state: IntermediaryState) -> Optional[str]:
+        """
+        Called for each streaming token from agent.
+        
+        Returns:
+            Progress update text, or null if nothing to report.
+        """
+        self.buffer += token
+        
+        # Check if it's time for an update (1-2s cadence)
+        if time.monotonic() - self.last_update > 1.5:
+            update = await self._maybe_summarize(state)
+            if update:
+                self.last_update = time.monotonic()
+                return update
+        return None
+    
+    async def _maybe_summarize(self, state: IntermediaryState) -> Optional[str]:
+        """Produce a milestone update if there's something to report."""
+        # 1. Check for topic shift or completion
+        # 2. If milestone reached: produce natural 1-sentence update
+        # 3. Otherwise: return null (don't spam)
+        pass
+```
+
+**Prompt** (`prompts/distill_system.md`):
+```
+You are a progress update generator. Given the agent's streaming output so
+far and the user's original request, produce a single natural-sounding update.
+
+Rules:
+1. ONE sentence. Conversational. Like a colleague updating you.
+2. If the agent is still figuring things out: "Looking into it..." / "Checking..."
+3. If the agent found something: "Found it — [key finding]"
+4. If the agent is going off-ttopic: output "DRIFT" (signal to steering engine)
+5. If nothing useful yet: output null
+
+User intent: {user_intent}
+Agent output: {partial_output}
+
+Output ONLY the update sentence, or null if nothing to report.
+```
 
 ### 3. Steer Engine (`intermediary/steer.py`)
 
-- **Hooks into existing `agent.steer()` — does NOT reinvent it**
-- Input: streaming tokens + user_intent baseline
-- Detect drift by comparing topic of output vs user_intent
-- If drift_confidence > threshold: `agent.steer("Stay focused on ...")`
-- Rate-limited: max 1 steer injection per exchange
+```python
+class SteerEngine:
+    """Detect agent drift and inject corrections mid-turn."""
+    
+    async def check_drift(self, partial_output: str, state: IntermediaryState) -> Optional[str]:
+        """
+        Args:
+            partial_output: Agent's output so far this turn
+            state: Per-session state with drift_baseline
+        
+        Returns:
+            Correction message to inject, or null if aligned.
+        """
+        # 1. Compare topic of partial_output vs drift_baseline
+        # 2. Compute drift_confidence (0.0 to 1.0)
+        # 3. If drift_confidence > threshold: draft correction
+        # 4. Else: return null
+        pass
+    
+    async def inject(self, plugin_ctx: PluginContext, session_id: str, correction: str):
+        """
+        Inject correction into agent's next tool result.
+        NON-interrupting (uses agent.steer() mechanism).
+        """
+        # Option A: If plugin_ctx.steer_agent(session_id, text) exists
+        # Option B: If we have cached agent reference: agent.steer(correction)
+        # Option C: Fallback to ctx.inject_message() (interrupts)
+        pass
+```
+
+**Prompt** (`prompts/steer_system.md`):
+```
+You are a drift detector for an AI agent. Determine if the agent is going
+off-topic compared to what the user originally asked for.
+
+User wanted: {user_intent}
+Agent is talking about: {current_topic}
+
+Rules:
+1. If aligned: output null (no intervention)
+2. If slightly off but productive: output null (let it continue)
+3. If clearly off-topic: output a 1-sentence correction for the agent
+4. Correction should be: "Stay focused on [user_intent]. [Redirect suggestion]"
+
+Output: null | correction text
+```
 
 ### 4. State Manager (`intermediary/state.py`)
 
@@ -174,16 +217,65 @@ class PluginContext:
 @dataclass
 class IntermediaryState:
     session_id: str
-    intent_history: list[str]      # Previous intents (for pronoun resolution)
-    drift_baseline: str           # What the agent should be doing
-    current_topic: str            # What the agent is currently discussing
-    steer_injected: bool          # Track if we already steered this exchange
-    message_queue: asyncio.Queue  # Pending intermediary messages
+    user_intent: str = ""           # Resolved user intent (no pronouns)
+    intent_history: list[str] = field(default_factory=list)  # Previous intents for pronoun resolution
+    drift_baseline: str = ""        # What we're checking against for drift
+    current_topic: str = ""         # What the agent is currently discussing
+    steer_injected: bool = False    # Track if we already steered this exchange
+    message_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 ```
 
-### 5. Audio Sublayer (`audio/`)
+### 5. Hook Registration (`intermediary/hooks.py`)
 
-Pluggable audio backends. Abstract base class:
+```python
+def register_hooks(ctx: PluginContext, intermediary: Intermediary):
+    """Register all Hermes plugin hooks."""
+    
+    @ctx.register_hook("pre_gateway_dispatch")
+    async def on_incoming(event, gateway, session_store):
+        """Refine incoming message before agent dispatch."""
+        if not event.text:
+            return
+        
+        state = intermediary.get_state(event.session_id)
+        refined = await intermediary.refine(event.text, state, {
+            "platform": event.platform.value,
+        })
+        
+        # Store original + refined
+        state.last_raw = event.text
+        state.last_refined = refined
+        state.user_intent = refined  # Update baseline
+        state.intent_history.append(refined)
+        
+        # Show refined via surface
+        await intermediary.surface.send_refined(event, event.text, refined)
+        
+        # Replace event text with refined
+        event.text = refined
+    
+    @ctx.register_hook("pre_llm_call")
+    async def on_before_llm(messages, session_id, **kwargs):
+        """Inject steering message if drift was detected."""
+        state = intermediary.get_state(session_id)
+        if state and state.pending_steering:
+            # Inject via agent.steer() or messages.append()
+            messages.append({
+                "role": "user",
+                "content": f"[User guidance] {state.pending_steering}"
+            })
+            state.pending_steering = None
+    
+    @ctx.register_hook("post_llm_call")
+    async def on_after_llm(response, session_id, **kwargs):
+        """Distill the response and update surface."""
+        state = intermediary.get_state(session_id)
+        if state:
+            summary = await intermediary.distill(response, state)
+            await intermediary.surface.update_progress(summary)
+```
+
+### 6. Audio Sublayer (`audio/`)
 
 ```python
 class AudioBackend(ABC):
@@ -203,168 +295,123 @@ class AudioBackend(ABC):
     
     @abstractmethod
     async def detect_turn(self, audio_stream) -> AsyncIterator[TurnEvent]:
-        """Yield TurnEvent(is_user_speaking, is_end_of_turn) for turn-taking."""
+        """Yield TurnEvent(is_user_speaking, is_end_of_turn)."""
 ```
 
-**Concrete implementations:**
+**Concrete backends**: `TENAudioBackend`, `PipecatAudioBackend`, `LiveKitAudioBackend`
 
-| Backend | Transport | Use Case | License |
-|---------|-----------|----------|---------|
-| `TENAudioBackend` | Custom | Full-duplex with TEN Turn Detection | Open-source |
-| `PipecatAudioBackend` | WebSocket | STT+LLM+TTS concurrent pipeline | BSD-2 |
-| `LiveKitAudioBackend` | WebRTC | Browser-based voice | Apache-2 |
-| `DiscordAudioBackend` | Discord VC | Existing hermes-agent Discord voice | (existing) |
-
-**TEN Turn Detection integration:**
-
-```python
-# audio/ten_backend.py
-class TENAudioBackend(AudioBackend):
-    """Full-duplex audio using TEN Framework for turn detection."""
-    
-    def __init__(self):
-        # Load TEN Turn Detection model from HuggingFace
-        self.turn_detector = TEN_Turn_Detection.from_pretrained(
-            "TEN-framework/TEN_Turn_Detection"
-        )
-    
-    async def detect_turn(self, audio_stream):
-        """Use TEN's model to detect when user is done speaking."""
-        async for chunk in audio_stream:
-            result = self.turn_detector.predict(chunk)
-            yield TurnEvent(
-                is_user_speaking=result.is_speaking,
-                is_end_of_turn=result.is_end_of_turn,
-                should_yield_floor=result.should_yield
-            )
-```
-
-### 6. Platform Surfaces
+### 7. Platform Surfaces
 
 #### Discord Surface (`surfaces/discord_surface.py`)
 
-- Two modes: **text channel** (progress updates) and **voice channel** (audio sublayer)
-- Text: edit-message pattern (existing `DiscordAdapter.edit_message()`)
-- Voice: bridge `VoiceReceiver` → STT → intermediary → agent, then TTS back to VC
+- `send_refined()`: Show `> refined text` as quote-reply to original message
+- `start_progress()`: Create message that will be edited with progress
+- `update_progress()`: Edit the progress message (rate-limited to 500ms)
+- `send_final()`: Replace progress with final summary
 
 #### WebUI Surface (`surfaces/webui_surface.py`)
 
-- Two-pane composer (raw + refined)
-- Intermediary sidebar (progress updates)
-- Audio: LiveKit or Pipecat backend for browser-based voice
-
-#### CLI Surface (`surfaces/cli_surface.py`)
-
-- Status line updates
-- Refined transcript confirmation before send
-
----
-
-## Prompt Engineering
-
-### Refine System Prompt
-
-```
-You are an input refinement engine. Restructure messy spoken/typed input into
-a clear, actionable prompt.
-
-Rules:
-1. Preserve original intent exactly
-2. Resolve pronouns using conversation context (intent_history)
-3. Expand vague references ("that thing" → specific noun)
-4. Output ONLY the refined prompt. No preamble.
-
-Conversation context: {intent_history}
-Raw input: {raw_input}
-```
-
-### Distill System Prompt
-
-```
-You are a progress update generator. Given the agent's streaming output so
-far and the user's original request, produce ONE natural-sounding update.
-
-Rules:
-1. ONE sentence. Conversational. Like a colleague updating you.
-2. If still figuring out: "Looking into it..." / "Checking..."
-3. If found something: "Found it — [key finding]"
-4. If going off-topic: output "DRIFT" (signal to steering engine)
-5. If nothing useful yet: output null
-
-User intent: {user_intent}
-Agent output: {partial_output}
-```
-
-### Steer System Prompt
-
-```
-You are a drift detector for an AI agent. Determine if the agent is going
-off-topic compared to what the user originally asked for.
-
-User wanted: {user_intent}
-Agent is talking about: {current_topic}
-
-Rules:
-1. If aligned: output null (no intervention)
-2. If slightly off but productive: output null (let it continue)
-3. If clearly off-topic: output a 1-sentence correction for the agent
-
-Output: null | "Redirect: stay focused on [user_intent]. [Suggestion]"
-```
+- SSE bridge to `/api/intermediary/stream`
+- Event types: `refined`, `progress`, `steering`, `final`
 
 ---
 
 ## Data Flow
 
 ### Text Path (Phase 1)
-
 ```
-User types/speaks → STT (if voice) → raw text
+User types in Discord/CLI/WebUI
   → pre_gateway_dispatch hook
     → intermediary.refine(raw_text)
     → surface.send_refined(raw, refined)
-    → event.text = refined  (replace for agent)
-  → Agent processes refined prompt (existing)
+    → event.text = refined (replace for agent)
+  → Agent processes refined prompt
   → Streaming response
-    → intermediary.distill(partial_tokens)
-      → surface.update_progress(summary)
-    → intermediary.steer.check(partial_tokens)
-      → if drift: agent.steer("Redirect: ...")
-        (injected into next tool result, NO interruption)
+    → intermediary.distill() → surface.update_progress()
+    → intermediary.steer.detect() → if drift: agent.steer("redirect")
   → Agent completes
     → surface.send_final(summary)
 ```
 
 ### Voice Path (Phase 2+)
-
 ```
 User speaks in Discord VC
   → VoiceReceiver captures PCM (existing)
-  → pcm_to_wav() → transcribe_audio() (existing)
-  → raw transcript
-    → intermediary.refine()
-    → Agent processes
-  → Streaming response
-    → intermediary.distill() → text channel updates
-    → intermediary.steer() → agent.steer() if drift
-  → Agent completes
-    → intermediary.summarize() → TTS → speak in VC
-    → Meanwhile: TEN/Pipecat detects if user barges in
-      → stop_speaking() → back to listening
+  → STT via transcription_tools (existing)
+  → raw transcript → intermediary.refine()
+  → Agent processes
+  → Streaming response → intermediary.distill()
+  → Agent completes → TTS → speak in VC
+    → Meanwhile: TEN/Pipecat detects barge-in → stop_speaking() → back to listening
 ```
 
-### Barge-in Flow (Full Duplex)
+---
 
+## Test Strategy
+
+### Overview
+
+All tests MUST be empirically validated (per `deep-think` skill). Session transcripts and code-reading over-report bugs by ~5x. We test by running the real system.
+
+### Test Types
+
+| Type | Tool | Evidence | When |
+|------|------|----------|------|
+| **Unit test** | pytest | Terminal output | Every engine |
+| **Integration test** | pytest + mock hermes-agent | Terminal output | Phase 1.3+ |
+| **Frontend test** | Playwright (headless browser) | Screenshot + video | Phase 4+ |
+| **Voice test** | Playwright + mic simulation | Video + audio recording | Phase 2+ |
+| **Manual E2E** | Human in Discord/WebUI | Video recording (screen capture) | Every phase |
+
+### Video Evidence (per user's request)
+
+For frontend and voice tests, we record video evidence using Playwright's built-in video recording:
+
+```python
+# In Playwright test config:
+browser = await playwright.chromium.launch(
+    record_video_dir="test-evidence/videos/",
+    record_video_size={"width": 1280, "height": 720}
+)
 ```
-Agent is speaking in VC (TTS audio playing)
-  → Audio backend detects user speech (VAD + TEN Turn Detection)
-  → stop_speaking() — cut TTS immediately
-  → Agent pauses (similar to pause() on VoiceReceiver)
-  → Listen to user input
-  → User stops speaking (end-of-turn detected)
-  → Refine + send to agent as steer message
-  → Agent adjusts course mid-response
-```
+
+**Video evidence is stored in**: `test-evidence/videos/{test-name}-{timestamp}.webm`
+
+**When to record**:
+- Phase 2+: Voice input tests (show mic → STT → refine → agent response)
+- Phase 4+: WebUI two-pane composer tests (show raw → refined → send → progress)
+- Phase 4+: Discord edit-message pattern tests (show progress being edited in place)
+
+### Phase 1 Test Plan (Text-Only)
+
+| Test | Type | Evidence |
+|------|------|----------|
+| Refine engine produces structured prompt | Unit | Terminal |
+| Refine resolves pronouns using history | Unit | Terminal |
+| Distill produces ≤3 updates per exchange | Unit | Terminal |
+| Steer detects drift and injects correction | Unit | Terminal |
+| Hook registration works with mock hermes-agent | Integration | Terminal |
+| Discord surface edits message (not new) | Integration | Terminal |
+| End-to-end: raw → refined → progress → final | Manual E2E | Screen recording |
+
+### Phase 2 Test Plan (Voice)
+
+| Test | Type | Evidence |
+|------|------|----------|
+| VoiceReceiver → STT → refine pipeline | Integration | Terminal |
+| Interim refinement while speaking | Manual E2E | Video |
+| Barge-in: user speaks → agent stops | Manual E2E | Video |
+| Turn detection: agent knows when to yield | Manual E2E | Video |
+
+### Phase 4 Test Plan (WebUI)
+
+| Test | Type | Evidence |
+|------|------|----------|
+| Two-pane composer renders | Playwright | Screenshot |
+| Real-time refinement as user types | Playwright | Video |
+| Sidebar shows progress updates | Playwright | Video |
+| Settings persist across reload | Playwright | Screenshot |
+| Voice button triggers intermediary | Playwright | Video |
 
 ---
 
@@ -374,7 +421,7 @@ Agent is speaking in VC (TTS audio playing)
 
 | File | Change |
 |------|--------|
-| `hermes_cli/plugins.py` | Add `intermediary_*` hooks to `VALID_HOOKS` |
+| `hermes_cli/plugins.py` | Add `intermediary_*` hooks to `VALID_HOOKS` (for observability) |
 | `hermes_cli/plugins.py` | Add `ctx.steer_agent(session_id, text)` method |
 | `hermes_cli/config.py` | Add `intermediary:` config section |
 | `gateway/platforms/discord.py` | Wire intermediary surface (minimal) |
@@ -390,44 +437,11 @@ Agent is speaking in VC (TTS audio playing)
 | `api/extensions.py` | SSE endpoint |
 | `api/upload.py` | Refine after STT |
 
-### New Files (this repo)
-
-```
-intermediary/
-  __init__.py
-  plugin.yaml
-  config.py
-  state.py
-  refine.py
-  distill.py
-  steer.py          # Hooks into agent.steer(), does NOT reinvent
-  hooks.py
-audio/
-  __init__.py
-  base.py           # AudioBackend ABC
-  ten_backend.py    # TEN Turn Detection integration
-  pipecat_backend.py # Pipecat pipeline
-  livekit_backend.py # LiveKit transport (browser)
-surfaces/
-  __init__.py
-  discord_surface.py
-  webui_surface.py
-  cli_surface.py
-prompts/
-  refine_system.md
-  distill_system.md
-  steer_system.md
-webui_extension/
-  intermediary.css
-  intermediary.js
-  manifest.json
-```
-
 ---
 
 ## External Dependencies
 
-| Dependency | Repo | License | What We Use It For |
+| Dependency | Repo | License | Use Case |
 |---|---|---|---|
 | **hermes-agent** | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) | — | Plugin host, agent.steer(), hooks |
 | **hermes-webui** | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | — | Extension host, browser UI |
@@ -435,41 +449,9 @@ webui_extension/
 | **TEN Framework** | [TEN-framework](https://github.com/ten-framework/ten-framework) | Open-source | Full-duplex turn detection |
 | **TEN Turn Detection** | [HuggingFace](https://huggingface.co/TEN-framework/TEN_Turn_Detection) | Open-source | Yield-floor detection |
 | **TEN VAD** | [HuggingFace](https://huggingface.co/TEN-framework/ten-vad) | Open-source | Voice activity detection |
-| **Pipecat** | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | BSD-2 | Concurrent STT+LLM+TTS pipeline |
-| **LiveKit** | [livekit/agents](https://github.com/livekit/agents) | Apache-2 | WebRTC transport (browser voice) |
+| **Pipecat** | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | BSD-2 | Concurrent STT+LLM+TTS |
+| **LiveKit** | [livekit/agents](https://github.com/livekit/agents) | Apache-2 | WebRTC browser voice |
 | **Langfuse** | [langfuse/langfuse](https://github.com/langfuse/langfuse) | MIT | Observability (optional) |
-
----
-
-## Why These Frameworks?
-
-### TEN Turn Detection (primary for turn-taking)
-
-- Open-source model trained specifically for human-AI turn-taking
-- Detects when the agent should yield the floor (user wants to speak)
-- Runs locally, no API dependency
-- Much better than simple VAD silence detection
-
-### Pipecat Pipeline (primary for concurrent audio)
-
-- `ParallelPipeline` runs STT, LLM, TTS concurrently
-- Barge-in support: detect user speech → stop TTS
-- Vendor-neutral: swap STT/LLM/TTS providers
-- Open-source Python
-
-### LiveKit (browser transport)
-
-- WebRTC transport for browser-based voice
-- Heavier dependency — only needed if WebUI voice is a priority
-- Alternative: WebSocket audio streaming is simpler for MVP
-
-### What We DON'T Need
-
-| Framework | Why Not |
-|---|---|
-| **Vapi** | Closed-source SaaS, telephony-focused |
-| **Retell** | Closed-source SaaS, telephony-focused |
-| **Full LiveKit** | Overkill unless browser voice is priority 1 |
 
 ---
 
@@ -495,15 +477,53 @@ webui_extension/
 - TEN model runs locally (no API calls for turn detection)
 - Conversation state (intent_history) stays in-memory per session, never persisted
 - Plugin respects existing `plugins.enabled` opt-in gate
+- No PII in logs at INFO level (only DEBUG + redacted)
 
 ---
 
-## Success Criteria Summary
+## Repo Structure
 
-See [ROADMAP.md](ROADMAP.md) for phase-by-phase human-verifiable success criteria.
-
-Key principles:
-- Human-verifiable (not just automated tests)
-- Each phase has concrete "signup and check this works" criteria
-- Steering uses `agent.steer()` (verified by checking tool result injection)
-- Audio sublayer is plug-and-play (verified by swapping backends)
+```
+intermediary-agent/
+  README.md
+  PLAN.md                    # This file
+  ROADMAP.md
+  INTEGRATION.md
+  intermediary/
+    __init__.py
+    plugin.yaml
+    config.py
+    state.py
+    refine.py
+    distill.py
+    steer.py
+    hooks.py
+  audio/
+    __init__.py
+    base.py
+    ten_backend.py
+    pipecat_backend.py
+    livekit_backend.py
+  surfaces/
+    __init__.py
+    discord_surface.py
+    webui_surface.py
+    cli_surface.py
+  prompts/
+    refine_system.md
+    distill_system.md
+    steer_system.md
+  webui_extension/
+    intermediary.css
+    intermediary.js
+    manifest.json
+  tests/
+    test_refine.py
+    test_distill.py
+    test_steer.py
+    test_hooks.py
+    test_audio_base.py
+  test-evidence/
+    videos/                  # Playwright video recordings
+    screenshots/             # Playwright screenshots
+```

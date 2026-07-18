@@ -84,7 +84,7 @@ This is a **hermes-agent plugin** that registers pipeline middleware:
 - **`pre_gateway_dispatch`** — intercept incoming messages, refine them
 - **`pre_llm_call`** — inject steering messages if drift detected
 - **`post_llm_call`** — distill the response, surface progress
-- **`inject_message()`** — correct the agent mid-turn
+- **`agent.steer()`** — correct the agent mid-turn (existing mechanism)
 
 Plus a **WebUI extension** for the browser UI.
 
@@ -188,8 +188,8 @@ intermediary-agent/
     steer.py             # Drift detection + correction
     hooks.py             # Hook registration
   surfaces/
-    discord_surface.py   # Text channel rendering (edit pattern)
-    webui_surface.py     # SSE bridge to WebUI
+    discord_surface.py   # Discord renderer
+    webui_surface.py     # WebUI SSE bridge
     cli_surface.py       # CLI status line
   prompts/
     refine_system.md     # "Restructure messy input..."

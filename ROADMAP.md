@@ -6,22 +6,25 @@
 - [x] Write PLAN.md (architecture, components, integration points)
 - [x] Write ROADMAP.md (this file)
 - [x] Write INTEGRATION.md (file paths, function signatures)
+- [x] Research existing /steer mechanism
+- [x] Research full-duplex audio frameworks (TEN, Pipecat, LiveKit)
 - [ ] Set up development environment (venv, dependencies)
 - [ ] Create test scaffolding
 
 ### Phase 0 Success Criteria (human-verifiable)
 
-- [ ] Repo has README that a new developer can read in 5 minutes and understand what we're building
-- [ ] PLAN.md describes every component with a diagram
-- [ ] ROADMAP.md has milestones for at least Phase 1-4
+- [ ] Repo README explains what we are building
+- [ ] PLAN.md has architecture diagram, component design, prompt templates
+- [ ] ROADMAP.md has phases with human-verifiable success criteria
+- [ ] Steering plan hooks into existing `agent.steer()` — not reinvented
+- [ ] Audio is pluggable sublayer (TEN/Pipecat/LiveKit) — not bolted on later
 - [ ] INTEGRATION.md has exact file paths for hermes-agent and hermes-webui
-- [ ] Repository is public on GitHub
 
 ---
 
-## Phase 1: Hermes-Agent Plugin (Text-Only, Discord)
+## Phase 1: Hermes-Agent Plugin (Text Only, Discord)
 
-**Goal**: Working intermediary as a hermes-agent plugin. Text input only. Discord surface.
+**Goal**: Working intermediary as a hermes-agent plugin. Text input only. Discord surface. No audio.
 
 ### Milestone 1.1: Plugin Scaffold
 - [ ] `intermediary/__init__.py` — register() entry point
@@ -30,171 +33,138 @@
 - [ ] `intermediary/state.py` — IntermediaryState dataclass
 - [ ] Unit tests for state management
 
-**Files**:
-```
-intermediary/
-  __init__.py
-  plugin.yaml
-  config.py
-  state.py
-tests/
-  test_state.py
-```
-
 ### Milestone 1.2: Refine Engine
-- [ ] `intermediary/refine.py` — single LLM call to refine input
+- [ ] `intermediary/refine.py` — LLM call to refine input
 - [ ] `prompts/refine_system.md` — refinement prompt template
-- [ ] Conversation context / pronoun resolution
-- [ ] Unit tests with mocked LLM responses
+- [ ] Conversation context + pronoun resolution
+- [ ] Unit tests with mocked LLM
 
-**Files**:
-```
-intermediary/
-  refine.py
-prompts/
-  refine_system.md
-tests/
-  test_refine.py
-```
-
-### Milestone 1.3: Hook Integration
+### Milestone 1.3: Hook Integration (pre_gateway_dispatch)
 - [ ] `intermediary/hooks.py` — register pre_gateway_dispatch hook
-- [ ] Wire: incoming message → refine → send refined to agent
+- [ ] Wire: incoming message → refine → replace event.text → send refined to agent
 - [ ] Store original + refined in state
 - [ ] Integration test with hermes-agent mock
 
-**Files**:
-```
-intermediary/
-  hooks.py
-tests/
-  test_hooks_integration.py
-```
-
 ### Milestone 1.4: Discord Surface
-- [ ] `surfaces/discord_surface.py` — send_refined, start_progress, update_progress
-- [ ] Edit-message pattern for progress updates
+- [ ] `surfaces/discord_surface.py` — edit-message pattern
+- [ ] send_refined(), start_progress(), update_progress(), send_final()
 - [ ] Rate-limited edits (500ms interval)
-- [ ] Final summary replacement
 - [ ] Mock Discord channel tests
 
-**Files**:
-```
-surfaces/
-  __init__.py
-  discord_surface.py
-tests/
-  test_discord_surface.py
-```
-
 ### Milestone 1.5: Distill Engine
-- [ ] `intermediary/distill.py` — buffer agent output, produce progress updates
+- [ ] `intermediary/distill.py` — buffer token stream, produce progress updates
 - [ ] `prompts/distill_system.md` — distillation prompt template
-- [ ] Streaming token buffer
 - [ ] Milestone detection (topic shifts, completions)
 - [ ] Unit tests with mock streaming
 
-**Files**:
-```
-intermediary/
-  distill.py
-prompts/
-  distill_system.md
-tests/
-  test_distill.py
-```
+### Milestone 1.6: Steer Engine (using agent.steer())
+- [ ] `intermediary/steer.py` — detect drift, call `agent.steer()` to inject correction
+- [ ] `prompts/steer_system.md` — drift detection prompt
+- [ ] CONFIRMED: steering uses existing `agent.steer()` — non-interrupting, injected into next tool result
+- [ ] Rate-limited: max 1 steer injection per exchange
+- [ ] Mock test: verify agent receives steer text after tool call
 
-### Milestone 1.6: End-to-End Text Test
-- [ ] Run intermediary with real hermes-agent (text-only, Discord DM)
-- [ ] Verify: raw text → refined → progress updates → final summary
-- [ ] Tune prompts based on real outputs
-- [ ] Latency measurements
+### Milestone 1.7: End-to-End Text Test
+- [ ] Run with real hermes-agent in Discord DM
+- [ ] Verify full flow: raw → refined → agent response → distill → final summary
+- [ ] Verify drift: when agent goes off-topic, it corrects without interruption
 
 ### Phase 1 Success Criteria (human-verifiable)
 
 **Test procedure**: Enable intermediary in a real Discord DM with the bot. Send text messages. Watch the bot response.
 
-- [ ] **Refine displays**: Bot sends the refined version of your messy text before its main response. (e.g., you send "um the docker thing?" → bot shows "Refined: Debug the Docker permission error")
-- [ ] **Edit pattern is working**: Bot edits its original message to update progress, not spam new messages. Send /reset, then send a prompt that elicits a long response. The bot's progress message should be EDITED in place.
-- [ ] **Progress updates are concise**: A long agent response (< 500 tokens) generates ≤ 3 progress updates from intermediary.
-- [ ] **Final summary appears**: After agent finishes, intermediary shows a single-line summary of the result.
-- [ ] **Latency acceptable**: Refined text appears within 1 second of hitting Enter.
-- [ ] **No-agent impact**: Disabling the intermediary plugin doesn't break normal bot behavior. Chat still works.
-- [ ] **Pronoun resolution works**: After discussing Docker in a conversation, sending "ok what about that?" → refined text correctly references "the Docker permission error".
-- [ ] **Rate limit safety**: Rapid-fire sending 5 messages in a row doesn't crash the intermediary or cause Discord API 429s.
+- [ ] **Refine displays**: Bot sends the refined version of your messy text before its main response
+- [ ] **Edit pattern**: Bot edits its original message to update progress, not spam new messages
+- [ ] **Progress updates concise**: A long agent response (<500 tokens) generates ≤3 progress updates
+- [ ] **Final summary appears**: After agent finishes, intermediary shows a single-line summary
+- [ ] **Latency**: Refined text appears within 1 second of hitting Enter
+- [ ] **No-agent fallback**: Disabling intermediary plugin doesn't break normal bot
+- [ ] **Pronoun resolution**: After discussing Docker, sending "ok what about that?" references "Docker permission error"
+- [ ] **Steer non-interrupting**: When agent goes off-topic, it continues working but receives correction. User does NOT see an interruption — agent just adjusts course
+- [ ] **Steer visible in logs**: Gateway log shows `agent.steer()` called with correction text
 
 ---
 
-## Phase 2: Voice Input (Discord)
+## Phase 2: Audio Sublayer + Voice Input
 
-**Goal**: Voice input via existing hermes-agent VoiceReceiver + STT.
+**Goal**: Plug in audio backends. Voice input via Discord voice channel.
 
-### Milestone 2.1: Voice-to-Refined Pipeline
+### Milestone 2.1: Audio Backend Abstraction
+- [ ] `audio/base.py` — AudioBackend ABC (start_listening, speak, stop_speaking, detect_turn)
+- [ ] `audio/ten_backend.py` — TEN Turn Detection integration for turn-taking
+- [ ] Abstract barge-in: user speaks → agent stops talking
+- [ ] Mock audio backend for testing
+
+### Milestone 2.2: Voice-to-Refined Pipeline
 - [ ] Bridge VoiceReceiver output → intermediary refine engine
-- [ ] Send refined transcript (not raw) to agent
+- [ ] STT → raw transcript → refine → send refined to agent
 - [ ] Surface: "Transcribing..." → "Refined: ..." → "Sending..."
+- [ ] Interim refinement while user still speaking
 
-### Milestone 2.2: Continuous Refinement
-- [ ] For long utterances, refine incrementally (interim results)
-- [ ] Show interim refined text while user is still speaking
-- [ ] Final refinement when silence detected
+### Milestone 2.3: Barge-in
+- [ ] When user speaks while agent is talking: stop TTS immediately
+- [ ] Back to listening without losing context
+- [ ] Surface: "Interrupted. Listening..."
+- [ ] TEN Turn Detection for determining when user is done speaking
+
+### Milestone 2.4: Audio Backend Swap Test
+- [ ] Mock backend → TEN backend: swap via config change, no code changes
+- [ ] Verify all backends implement the same interface
+- [ ] Latency comparison: mock vs TEN vs (future) Pipecat
 
 ### Phase 2 Success Criteria (human-verifiable)
 
-**Test procedure**: Join a Discord voice channel. Speak to the bot. Watch text channel updates.
+**Test procedure**: Join Discord voice channel. Speak to the bot. Watch text channel updates.
 
-- [ ] **Voice transcribes**: Speaking in VC causes the bot to transcribe your speech and show the raw transcript in the text channel
-- [ ] **Refinement is visible**: The refined transcript appears in the text channel before the bot's response
-- [ ] **Interim refinement**: While you're still speaking, the bot shows refining text updates (so you know it's working)
-- [ ] **No voice when agent speaks**: Bot pauses your mic while playing its TTS reply (if applicable), preventing self-hearing
-- [ ] **Silence detection works**: Bot auto-sends after you stop speaking (1.5s silence), doesn't wait forever
-- [ ] **Empty speech handled**: If you make noise but say nothing, bot shows "No speech detected" instead of sending garbage
+- [ ] **Voice transcribes**: Speaking in VC causes bot to transcribe and show raw transcript in text channel
+- [ ] **Refinement visible**: Refined transcript appears before bot's response
+- [ ] **Barge-in works**: Start speaking while bot is replying → bot stops talking within 200ms
+- [ ] **Turn detection**: Bot knows when you're done speaking, doesn't cut you off mid-sentence
+- [ ] **No self-hearing**: Bot's own TTS output doesn't trigger its own STT
+- [ ] **Audio backend swap**: Config change `audio.backend: ten` → works. `audio.backend: mock` → works. Same intermediary logic.
 
 ---
 
-## Phase 3: Steering Engine
+## Phase 3: Pipecat Integration (Concurrent Pipeline)
 
-**Goal**: Detect and correct agent drift mid-stream.
+**Goal**: Pipecat for concurrent STT+LLM+TTS. Enables true full-duplex — agent can start responding before user finishes speaking.
 
-### Milestone 3.1: Drift Detection
-- [ ] `intermediary/steer.py` — compare streaming output to user_intent
-- [ ] `prompts/steer_system.md` — drift detection prompt
-- [ ] Confidence scoring (don't intervene too early)
+### Milestone 3.1: Pipecat Backend
+- [ ] `audio/pipecat_backend.py` — Pipecat pipeline integration
+- [ ] ParallelPipeline: STT, LLM, TTS running concurrently
+- [ ] Barge-in via Pipecat's built-in interruption handling
 
-### Milestone 3.2: Injection Mechanism
-- [ ] `ctx.inject_message()` to redirect mid-turn
-- [ ] Surface: "Redirecting: stay focused on..."
-- [ ] Track injection history (avoid repeated steering on same topic)
+### Milestone 3.2: Concurrent Input/Output
+- [ ] Agent starts responding while user finishes speaking (streaming STT → LLM)
+- [ ] TTS starts before full response is generated
+- [ ] If user interrupts: stop TTS, flush LLM buffer, return to listening
 
-### Milestone 3.3: Steering Tuning
-- [ ] Don't over-steer (let agent explore productively)
-- [ ] Don't under-steer (catch real drift early)
-- [ ] A/B test drift_confidence thresholds
+### Milestone 3.3: Latency Optimization
+- [ ] Measure: user stops speaking → agent starts responding
+- [ ] Target: <500ms (the "full-duplex threshold")
+- [ ] Compare: TEN backend vs Pipecat backend latency
 
 ### Phase 3 Success Criteria (human-verifiable)
 
-**Test procedure**: Deliberately ask the bot a question that might elicit off-topic information. Example: "how do i fix the docker permission error?" when the bot historically explains docker architecture.
-
-- [ ] **Steering triggers on drift**: When the bot starts going off-topic, the intermediary injects a correction message (visible in log/channel)
-- [ ] **Progress shows redirection**: Intermediary updates its progress message to mention redirection ("Redirecting, stay focused on the fix...")
-- [ ] **No over-steering**: Bot exploring related-but-useful context (e.g., checking logs to find the cause) doesn't trigger steering
-- [ ] **Agent corrects course**: After steering injection, the agent gets back to the user's intent
-- [ ] **Injection is single, not spammy**: Max one steering injection per exchange. No repeated corrections for the same topic
+- [ ] **Concurrent**: Start responding before user finishes speaking — you hear the agent begin while you're still talking
+- [ ] **Sub-second latency**: Agent starts responding <500ms after you stop speaking
+- [ ] **No echo**: Agent doesn't react to its own voice output
+- [ ] **Interrupt召 works mid-sentence**: Agent cuts itself off when you start speaking
 
 ---
 
 ## Phase 4: WebUI Extension
 
-**Goal**: Two-pane composer + intermediary sidebar in hermes-webui.
+**Goal**: Two-pane composer + intermediary sidebar + browser voice.
 
 ### Milestone 4.1: Extension Scaffold
-- [ ] `webui_extension/` — extension files (manifest, HTML, CSS, JS)
+- [ ] `webui_extension/` — manifest, CSS, JS
 - [ ] Register with hermes-webui extension system
 - [ ] SSE connection to intermediary API
 
 ### Milestone 4.2: Two-Pane Composer
 - [ ] Raw transcript pane (top, grayed)
-- [ ] Refined pane bottom, editable)
+- [ ] Refined pane (bottom, editable)
 - [ ] Real-time update as user types/speaks
 
 ### Milestone 4.3: Intermediary Sidebar
@@ -202,94 +172,82 @@ tests/
 - [ ] Steering notifications
 - [ ] Final summary card
 
-### Milestone 4.4: Settings Panel
-- [ ] Toggle refine/distill/steer independently
-- [ ] Model selection per engine
-- [ ] Update interval controls
-- [ ] Auto-send vs manual approve
+### Milestone 4.4: WebUI Voice (LiveKit)
+- [ ] LiveKit audio backend for browser voice
+- [ ] Connect to intermediary audio sublayer
+- [ ] Two-way voice: speak in browser, hear agent response
 
 ### Phase 4 Success Criteria (human-verifiable)
 
-**Test procedure**: Open WebUI in browser. Type in the intermediary pane. Use mic for voice.
-
-- [ ] **Installation**: `hermes webui extensions install intermediary` installs the extension. Or it appears in the Extensions gallery.
-- [ ] **Two-pane visible**: Composer has raw + refined panes, clearly labeled, not overlapping
-- [ ] **Real-time refinement**: As you type "um the docker thing?", refined panes shows "Debug the Docker permission error" within 500ms
-- [ ] **Editable refined**: You can click into the refined pane and edit before hitting Enter. Sending uses YOUR edited text, not the original refinement
-- [ ] **Sidebar shows progress**: During a long bot response, the sidebar shows "Looking into it..." → "Found 3 issues" → "Here's the main one"
-- [ ] **Voice button triggers intermediary**: Clicking mic → STT → intermediary refines → both panes update. Not just direct send.
-- [ ] **Settings persist**: Toggle "refine" off → reload → still off. (localStorage or settings API)
-- [ ] **Mobile works**: Composer doesn't break on narrow panes; panes stack vertically or collapse
+- [ ] **Two-pane visible**: Composer has raw + refined panes
+- [ ] **Real-time refinement**: As you type "um the docker thing?", refined pane shows "Debug the Docker permission error" within 500ms
+- [ ] **Editable refined**: Click into refined pane, edit, send YOUR text
+- [ ] **Sidebar progress**: During long agent response, sidebar shows "Looking into it..." → "Found 3 issues" → "Here's the main one"
+- [ ] **Browser voice**: Click mic in WebUI → speak → agent responds by voice
+- [ ] **Mobile works**: Composer doesn't break on narrow screens
 
 ---
 
 ## Phase 5: CLI/TUI Surface
 
-**Goal**: Status line + refined display in terminal.
+**Goal**: Terminal interface.
 
 ### Milestone 5.1: CLI Surface
-- [ ] `surfaces/cli_surface.py`
-- [ ] Status bar updates (looking into it... / found it...)
-- [ ] Refined transcript display before send
+- [ ] `surfaces/cli_surface.py` — status line updates
+- [ ] Refined transcript confirmation before send
 
 ### Phase 5 Success Criteria (human-verifiable)
 
-**Test procedure**: Run `hermes` in terminal. Type messages.
-
-- [ ] **Status line shows progress**: During response, a status/display line shows intermediary updates ("Looking into it..." → "Found it")
-- [ ] **Refined prompt displays**: After typing, refined prompt shown (with [y/n] or similar to confirm send)
-- [ ] **Color coding**: Success/failure visually distinct in terminal (green ✓, red ✗, yellow ⟳)
+- [ ] **Status line**: During agent response, status updates like Discord pane
+- [ ] **Refined confirmation**: Shows refined prompt, [y/n] to send
+- [ ] **Color coding**: Green ✓, red ✗, yellow ⟳ for progress states
 
 ---
 
 ## Phase 6: Hardening & Polish
 
-**Goal**: Production-ready.
-
 ### Milestone 6.1: Error Handling
-- [ ] LLM call failures → graceful degradation (pass-through)
+- [ ] LLM call failures → pass-through mode
+- [ ] Audio backend failures → fall back to text
 - [ ] Rate limit handling
-- [ ] Timeout handling
 
 ### Milestone 6.2: Observability
-- [ ] Langfuse tracing integration (reuse existing langfuse plugin)
+- [ ] Langfuse tracing integration
 - [ ] Per-exchange latency telemetry
 - [ ] Drift event logging
 
 ### Milestone 6.3: Documentation
-- [ ] User guide (how to enable, how to use)
-- [ ] Developer guide (how it works, how to extend)
+- [ ] User guide
+- [ ] Developer guide
 - [ ] Configuration reference
 
 ### Phase 6 Success Criteria (human-verifiable)
 
-- [ ] **Offline recovery**: If intermediary's LLM provider is unreachable, the conversation still works normally (just no refinement/distillation/stats) — logs show "intermediary unavailable, pass-through mode"
-- [ ] **Config validation**: Setting `intermediary.enabled: yes` or `intermediary.features.refine: 1` doesn't crash; human-friendly warning shown
-- [ ] **Self-diagnostic**: `hermes intermediary doctor` reports: plugin loaded? config valid? LLM provider reachable? Discord surface ready?
-- [ ] **Log volume reasonable**: A single exchange generates < 20 intermediary log lines at INFO level
-- [ ] **No PII in logs**: User messages are not logged verbatim at INFO level (only at DEBUG + redacted)
+- [ ] **Offline recovery**: Intermediary's LLM provider unreachable → conversation still works (no refinement, no distill, no steer), logs show "pass-through mode"
+- [ ] **Self-diagnostic**: `hermes intermediary doctor` reports: plugin loaded? config valid? LLM reachable? Audio backend ready?
+- [ ] **No PII in logs**: User messages not logged at INFO level (only DEBUG + redacted)
 
 ---
 
 ## Phase 7: Research & Advanced Features
 
 ### Milestone 7.1: Multi-Turn Refinement
-- [ ] Use conversation history to resolve references
 - [ ] Cross-turn pronoun tracking
+- [ ] Reference resolution across 5+ turns
 
-### Milestones 7.2: Proactive Suggestions
+### Milestone 7.2: Proactive Suggestions
 - [ ] Intermediary suggests follow-up questions
 - [ ] Pre-fetch likely needed context
 
 ### Milestone 7.3: User Model
-- [ ] Learn user's preferred communication style
+- [ ] Learn preferred communication style
 - [ ] Adapt distillation level per user
 
 ### Phase 7 Success Criteria (human-verifiable)
 
-- [ ] **Reference resolution**: After 5+ turns discussing multiple topics, "fix that" correctly references the most recent topic, not the oldest
-- [ ] **Follow-up suggestions**: After a bot response finishes, intermediary suggests 2-3 natural follow-ups (visible as clickable chips or text)
-- [ ] **Style adaptation**: After 3+ sessions, intermediary refines in a way the user finds natural (subjective but verifiable via user feedback)
+- [ ] **Reference resolution**: After 5+ turns discussing multiple topics, "fix that" correctly references the most recent topic
+- [ ] **Follow-up suggestions**: After agent response finishes, intermediary suggests 2-3 natural follow-ups
+- [ ] **Style adaptation**: After 3+ sessions, intermediary refines in a way the user finds natural
 
 ---
 
@@ -297,73 +255,153 @@ tests/
 
 A phase is complete when:
 - [ ] All milestones checked off
-- [ ] Tests passing (`pytest tests/ -q`)
-- [ ] Linting clean (`ruff check intermediary/`)
+- [ ] Tests passing
+- [ ] Linting clean
 - [ ] Manual E2E test passed on all supported platforms (success criteria above)
-- [ ] Documentation updated (README, PLAN, INTEGRATION reflect current state)
+- [ ] Documentation updated
 - [ ] No regressions in existing hermes-agent/hermes-webui tests
-- [ ] README success criteria section updated to reflect current phase
 
 ---
 
 ## External Dependencies
 
-| Dependency | Repo | Status | Notes |
+| Dependency | Repo | Status | Use Case |
 |---|---|---|---|
-| Plugin system | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | `PluginContext`, hooks, `VALID_HOOKS` |
-| Voice IO | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | `VoiceReceiver` in `gateway/platforms/discord.py` |
-| STT | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | `tools/transcription_tools.py` |
-| WebUI Extensions | [hermes-webui](https://github.com/ChonSong/hermes-webui) | ✅ Existing | `static/extension_settings.js`, `api/extensions.py` |
-| Discord API | [discord.py](https://github.com/Rapptz/discord.py) | ✅ Existing | `VoiceClient`, `edit_message` |
-| Observability | [Langfuse](https://github.com/langfuse/langfuse) | ✅ Existing | `plugins/observability/langfuse/` |
+| Plugin system | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | PluginContext, hooks, agent.steer() |
+| Voice IO | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | VoiceReceiver |
+| STT | [hermes-agent](https://github.com/NousResearch/hermes-agent) | ✅ Existing | transcription_tools |
+| WebUI Extensions | [hermes-webui](https://github.com/ChonSong/hermes-webui) | ✅ Existing | extension_settings.js, extensions.py |
+| Discord API | [discord.py](https://github.com/Rapptz/discord.py) | ✅ Existing | VC + edit_message |
+| Observability | [Langfuse](https://github.com/langfuse/langfuse) | ✅ Existing | (optional) |
+| Turn Detection | [TEN](https://github.com/ten-framework/ten-framework) | 🆕 New | Full-duplex turn-taking |
+| VAD | [TEN](https://huggingface.co/TEN-framework/ten-vad) | 🆕 New | Voice activity detection |
+| Pipeline | [Pipecat](https://github.com/pipecat-ai/pipecat) | 🆕 New | Concurrent STT+LLM+TTS |
+| Transport | [LiveKit](https://github.com/livekit/agents) | 🆕 New | Browser WebRTC voice |
 
-## Hermes-Agent Plugin Development Workflow
+---
 
-### Dev Install
-```bash
-# In hermes-agent checkout
-pip install -e path/to/intermediary-agent
+## Hermes-Agent Plugin API Quick Reference
+
+### Hooks (lifecycle callbacks)
+
+```python
+def register_hook(self, name: str, callback: Callable) -> None: ...
+
+# Existing hooks we use:
+ctx.register_hook("pre_gateway_dispatch", on_incoming)
+ctx.register_hook("on_session_start", on_session_start)
+ctx.register_hook("on_session_end", on_session_end)
+
+# New hooks we add:
+ctx.register_hook("intermediary_refined", on_refined)
+ctx.register_hook("intermediary_distilled", on_distilled)
+ctx.register_hook("intermediary_steered", on_steered)
 ```
 
-### Enable Plugin
+### Context Injection (existing, we use this)
+
+```python
+ctx.inject_message("Stay focused", role="user")
+# → INTERRUPTS the agent and injects the message
+# → For CLI mode: cli._interrupt_queue.put(msg)
+# → For gateway mode: interrupts pending agent run
+```
+
+### Steer Injection (existing, WE USE THIS FOR DRIFT)
+
+```python
+# In PluginContext, add:
+ctx.steer_agent(session_id, "Stay focused on the fix")
+# → Calls agent.steer(text) — NON-interrupting
+# → Text is appended to next tool result as "User guidance: ..."
+# → Agent sees correction inline, adjusts without interruption
+```
+
+### New: Audio Backend Config
+
 ```yaml
 # ~/.hermes/config.yaml
-plugins:
-  enabled:
-    - intermediary
+intermediary:
+  enabled: true
+  features:
+    refine: true
+    distill: true
+    steer: true
+  audio:
+    backend: ten    # ten | pipecat | livekit | discord | none
+    barge_in: true
+    turn_detection: true
+  models:
+    refine: "default"
+    distill: "default"
+    steer: "default"
+  thresholds:
+    drift_confidence: 0.7
+    silence_ms: 1800
 ```
 
-### Test with Discord
-```bash
-# Terminal 1: Start hermes gateway with intermediary
-hermes gateway
+---
 
-# Terminal 2: Watch logs
-tail -f ~/.hermes/logs/gateway.log | grep -i intermediary
+## Files Created / Modified
+
+### New Files (this repo)
+
+```
+intermediary-agent/
+  README.md
+  PLAN.md
+  ROADMAP.md
+  INTEGRATION.md
+  intermediary/
+    __init__.py
+    plugin.yaml
+    config.py
+    state.py
+    refine.py
+    distill.py
+    steer.py
+    hooks.py
+  audio/
+    __init__.py
+    base.py
+    ten_backend.py
+    pipecat_backend.py
+    livekit_backend.py
+  surfaces/
+    __init__.py
+    discord_surface.py
+    webui_surface.py
+    cli_surface.py
+  prompts/
+    refine_system.md
+    distill_system.md
+    steer_system.md
+  webui_extension/
+    intermediary.css
+    intermediary.js
+    manifest.json
+  tests/
+    test_refine.py
+    test_distill.py
+    test_steer.py
+    test_hooks.py
+    test_audio_base.py
 ```
 
-## Key Hermes-Agent Code Paths (for reference)
+### Modified Files (in hermes-agent / hermes-webui)
 
-| Purpose | File | Symbol |
-|---|---|---|
-| Plugin registration | `hermes_cli/plugins.py` | `PluginContext.register()` |
-| Hook invocation | `hermes_cli/plugins.py` | `invoke_hook(name, **kwargs)` |
-| Pre-dispatch hook | `hermes_cli/plugins.py` | `VALID_HOOKS` includes `pre_gateway_dispatch` |
-| Message injection | `hermes_cli/plugins.py` | `ctx.inject_message(content, role)` |
-| Discord adapter | `gateway/platforms/discord.py` | `class DiscordAdapter` |
-| Voice receiver | `gateway/platforms/discord.py` | `class VoiceReceiver` |
-| Discord edit | `gateway/platforms/discord.py` | `async def edit_message()` |
-| Voice STT | `tools/transcription_tools.py` | `transcribe_audio(file_path)` |
-| Voice mode | `tools/voice_mode.py` | Voice mode state machine |
-| Config schema | `hermes_cli/config.py` | `load_config()`, `cfg_get()` |
+```
+hermes-agent/
+  hermes_cli/plugins.py              # Add intermediary hooks + ctx.steer_agent()
+  hermes_cli/config.py               # Add intermediary: config section
+  gateway/platforms/discord.py       # Wire audio backend to VoiceReceiver (minimal)
 
-## Key Hermes-WebUI Code Paths (for reference)
-
-| Purpose | File | What to Add |
-|---|---|---|
-| Extension hookup | `static/extension_settings.js` | Register intermediary extension |
-| Composer UI | `static/index.html` | Two-pane composer markup |
-| Voice pipeline | `static/boot.js` | Intermediary intercept after STT |
-| Settings UI | `static/panels.js` | Intermediary preferences |
-| Backend API | `api/extensions.py` | `/api/intermediary/stream` SSE |
-| TTS registration | `static/boot.js` | (already exists, reuse pattern for intermediary) |
+hermes-webui/
+  static/extension_settings.js       # Register intermediary extension
+  static/boot.js                     # Intercept STT/text, refine
+  static/ui.js                       # Two-pane composer + sidebar
+  static/panels.js                   # Intermediary preferences
+  static/index.html                  # Composer markup + sidebar
+  api/extensions.py                  # SSE endpoint
+  api/upload.py                      # Refine after STT
+```

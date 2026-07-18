@@ -1,6 +1,6 @@
 # Intermediary Agent — Roadmap
 
-## Phase 0: Foundation
+## Phase 0: Foundation (Current)
 
 - [x] Create repo structure
 - [x] Research LiveKit, Pipecat, TEN Framework
@@ -15,85 +15,79 @@
 - [ ] Set up development environment
 - [ ] Create test scaffolding
 
-### Phase 0 Success Criteria
-
-- [ ] PLAN.md documents the full LiveKit + Hermes architecture
-- [ ] Hermes integration uses existing WebUI API (zero changes to hermes-agent)
-- [ ] Audio sublayer is pluggable (TEN/Pipecat/LiveKit)
-- [ ] Steering uses barge-in + [User guidance] injection (NOT autonomous drift detection)
-- [ ] Test strategy includes video evidence for frontend/voice tests
-
 ---
 
 ## Phase 1: LiveKit Agent + Hermes API (MVP)
 
-**Goal**: Working intermediary using LiveKit Agent + Hermes WebUI API. User connects to LiveKit room, speaks, intermediary refines → sends to Hermes → distills response → speaks back. User sees full text transcript.
+**Goal**: Working LiveKit agent that:
+- Refines messy input via system prompt
+- Pipes Hermes SSE through distillation buffer → LiveKit TTS
+- Captures barge-in → IMMEDIATELY POST /api/chat/steer (NOT after SSE ends)
+- Shows full text transcript in browser
 
 ### Milestone 1.1: Project Scaffold
 - [ ] `pyproject.toml` — Python package with LiveKit dependencies
 - [ ] `intermediary/__init__.py` — package init
 - [ ] `intermediary/agent.py` — LiveKit `IntermediaryAgent` class
-- [ ] `intermediary/hermes_client.py` — `HermesClient` class for `/api/chat` SSE
+- [ ] `intermediary/hermes_client.py` — `HermesClient` (HTTP + SSE streaming)
 - [ ] `intermediary/session.py` — `SessionState` + `SessionManager`
 - [ ] `intermediary/prompts.py` — System prompt templates
-- [ ] `intermediate/refinement.py` — Refinement logic
-- [ ] `intermediary/distillation.py` — LLM Output Replacement for Hermes responses
-- [ ] `intermediary/steering.py` — `SteeringController` for barge-in
+- [ ] `intermediary/distillation.py` — Buffer + distill logic
+- [ ] `intermediary/steering.py` — Barge-in capture (IMMEDIATE POST, not wait)
 - [ ] `scripts/dev.sh` — Run locally with LiveKit CLI
 
-### Milestone 1.2: Hermes Client + SSE Streaming
-- [ ] `HermesClient.create_session()` — creates Hermes session via `/api/sessions`
-- [ ] `HermesClient.send_message()` — POST to `/api/chat`, yields SSE chunks
-- [ ] Handle SSE format: `data: {"type": "delta", "content": "..."}`
-- [ ] Handle `tool_use`, `thinking`, `error`, `done` event types
+### Milestone 1.2: Hermes API Client
+- [ ] `HermesClient.create_session()` — POST /api/sessions
+- [ ] `HermesClient.start_chat(message)` — POST /api/chat/start → stream_id
+- [ ] `HermesClient.stream_chat(stream_id)` — GET /api/chat/stream → AsyncIterable[str]
+- [ ] `HermesClient.steer(session_id, text)` — POST /api/chat/steer
+- [ ] Handle SSE parsing (`data: {...}\n\n`)
 - [ ] Unit tests with mock SSE stream
 
-### Milestone 1.3: Intermediary Agent + LiveKit Integration
+### Milestone 1.3: Intermediary Agent + LiveKit
 - [ ] `IntermediaryAgent` connects to LiveKit room
-- [ ] `on_user_speech_committed()` handler — refine → Hermes → distill → TTS
+- [ ] `on_user_speech_committed()` — refine → start Hermes → yield distilled chunks
 - [ ] `on_participant_connected()` — create Hermes session
 - [ ] `on_participant_disconnected()` — cleanup
 - [ ] Forward transcription events to frontend WebSocket
-- [ ] System prompt includes refinement/distillation/steering rules
-- [ ] Integration test: connect to room, verify session creation
 
-### Milestone 1.4: Distillation (LLM Output Replacement)
-- [ ] `DistillationFilter` class — intercepts Hermes text before TTS
-- [ ] Strip `<think>` blocks, markdown, tool JSON
-- [ ] Summarize to 1-2 sentences (LLM OR heuristic)
-- [ ] Unit test: 3-paragraph input → 1-2 sentence output
-- [ ] Handle empty/suppressed output (don't speak)
+### Milestone 1.4: Distillation Buffer
+- [ ] Buffer SSE deltas (1-4 chars) until sentence boundary
+- [ ] `has_sentence_boundary()` — detect `.`, `!`, `?`, `:`, `,\s`, `\n`
+- [ ] On boundary: pass buffer to distillation LLM
+- [ ] Yield distilled text to LiveKit
+- [ ] LiveKit Synthesizer handles audio chunking/queueing
+- [ ] Unit test: 3-paragraph input → 1-2 sentence output per yield
 
 ### Milestone 1.5: Transcript UI
 - [ ] `webui/app.py` — FastAPI app serving transcript UI
 - [ ] `webui/templates/index.html` — Chat panel layout
-- [ ] `webui/static/transcript.js` — LiveKit transcription display
-- [ ] WebSocket endpoint `/ws/transcript` — forward LiveKit events to browser
+- [ ] WebSocket endpoint `/ws/transcript` — forward LiveKit events
 - [ ] Render: user messages, intermediary messages, Hermes raw, agent speaking
-- [ ] Render: steer events (highlighted)
 - [ ] Color coding: user=blue, intermediary=green, hermes=gray
 
-### Milestone 1.6: Barge-in + Steering
-- [ ] `_is_barge_in()` — detect user speech while agent speaking
-- [ ] `_handle_barge_in()` — stop TTS, capture text as pending steer
-- [ ] Generation ID tracking to discard stale Hermes chunks
-- [ ] `maybe_steer()` — inject pending steer after Hermes finishes
-- [ ] Integration test: barge-in during TTS → TTS stops → steer sent
+### Milestone 1.6: Barge-in + Steering (CRITICAL TIMING)
+- [ ] VAD detects user speech while agent is speaking
+- [ ] IMMEDIATELY: `session.stop_speaking()` + POST /api/chat/steer
+- [ ] NOT after SSE ends — steer while agent is still running
+- [ ] Set `steer_active = true` — drop stale SSE deltas
+- [ ] When agent applies steer at tool boundary, clear `steer_active`
+- [ ] Resume distillation from new response
+- [ ] Integration test: barge-in immediately triggers `/steer` call
 
 ### Milestone 1.7: Voice Pipeline
-- [ ] LiveKit native STT (Deepgram Nova-3 or similar)
-- [ ] LiveKit native TTS (Cartesia Sonic-3 or similar)
+- [ ] LiveKit native STT (Deepgram Nova-3)
+- [ ] LiveKit native TTS (Cartesia Sonic-3)
 - [ ] Echo cancellation (LiveKit built-in)
 - [ ] Turn detection (LiveKit built-in)
-- [ ] Voice activity detection (VAD)
 - [ ] Connect microphone + speakers
 
 ### Milestone 1.8: End-to-End Test
 - [ ] Connect to LiveKit room from browser
 - [ ] Speak: intermediary refines → sends to Hermes → distills → speaks
 - [ ] Verify text transcript shows all exchanges
-- [ ] Verify barge-in stops TTS and injects steer
-- [ ] Record screen video of full flow → `test-evidence/videos/phase1-e2e.webm`
+- [ ] Verify barge-in stops TTS and injects steer IMMEDIATELY (before SSE ends)
+- [ ] Record screen video → `test-evidence/videos/phase1-e2e.webm`
 
 ### Phase 1 Success Criteria (human-verifiable)
 
@@ -102,43 +96,35 @@
 - [ ] **Connection**: Browser connects to LiveKit room, creates Hermes session
 - [ ] **Refine visible**: User speech → refined text shown in transcript
 - [ ] **Hermes query**: Refined text sent to Hermes (visible in Hermes logs)
-- [ ] **Distill visible**: Hermes response → distilled text shown + spoken
-- [ ] **Transcript complete**: All exchanges (user, intermediary, Hermes raw, agent speaking) visible
+- [ ] **Distill visible**: Hermes response → distilled text → spoken
+- [ ] **Transcript complete**: All exchanges visible
 - [ ] **Barge-in cuts TTS**: User speaks while agent talking → TTS stops within 200ms
-- [ ] **Steer appears**: Barge-in text shown as `[Steer]` in transcript
-- [ ] **Steer injected**: After Hermes finishes, steer sent as `[User guidance] <text>`
-- [ ] **Hermes adjusts**: Hermes changes course based on steer
-- [ ] **Latency acceptable**: User speaks → agent responds within 2 seconds
+- [ ] **Steer immediate**: POST /api/chat/steer happens BEFORE SSE stream ends (not after)
+- [ ] **Steer accepted**: Response shows `accepted: true` (not `stream_dead`)
+- [ ] **Hermes adjusts**: Agent changes course based on steer
+- [ ] **Latency acceptable**: User speaks → agent responds within 2.5s
 - [ ] **Video evidence**: Full E2E flow recorded in `test-evidence/videos/phase1-e2e.webm`
 
 ---
 
-## Phase 2: Audio Sublayer (TEN Turn Detection)
+## Phase 2: TEN Turn Detection (Optional Enhancement)
 
-**Goal**: Replace LiveKit's default turn detection with TEN Turn Detection for better full-duplex behavior (yield floor, backchannels, natural turn-taking).
+**Goal**: Replace LiveKit's default VAD-based turn detection with TEN Turn Detection for better full-duplex behavior.
 
-### Milestone 2.1: Audio Backend Abstraction
-- [ ] `audio/base.py` — `AudioBackend` ABC (start_listening, speak, stop_speaking, detect_turn)
-- [ ] `audio/livekit_native.py` — LiveKit built-in STT/TTS
-- [ ] `audio/ten_backend.py` — TEN Turn Detection integration
-- [ ] Config-driven backend selection: `audio.backend: livekit|ten`
-
-### Milestone 2.2: TEN Turn Detection
+### Milestone 2.1: TEN Backend
 - [ ] Load TEN Turn Detection model from HuggingFace
-- [ ] `detect_turn()` — yield TurnEvent(is_speaking, is_end_of_turn, should_yield_floor)
-- [ ] Integrate with intermediary agent: use TEN events instead of LiveKit's
+- [ ] `audio/ten_backend.py` — detect yield-floor, backchannels
+- [ ] Config-driven: `audio.backend: livekit|ten`
 
-### Milestone 2.3: Barge-in with TEN
+### Milestone 2.2: Barge-in with TEN
 - [ ] User speech detected by TEN → stop TTS immediately
 - [ ] TEN determines when user is done speaking
-- [ ] Intermediary responds after TEN says end-of-turn
 
 ### Phase 2 Success Criteria
 
-- [ ] **TEN backend works**: `audio.backend: ten` → turn detection works
-- [ ] **Backend swap**: Config change from `livekit` to `ten` → no code changes needed
-- [ ] **Natural turn-taking**: Agent knows when to yield without VAD silence timeout
-- [ ] **Video evidence**: Full-duplex conversation recorded
+- [ ] TEN backend: `audio.backend: ten` → turn detection works
+- [ ] Backend swap via config: `livekit` → `ten` (no code changes)
+- [ ] Video evidence: full-duplex conversation recorded
 
 ---
 
@@ -151,43 +137,18 @@
 - [ ] Forward Discord PCM to STT
 - [ ] Forward TTS output to Discord voice channel
 
-### Milestone 3.2: Text Channel Integration
-- [ ] Text channel shows transcript (same as WebUI transcript)
-- [ ] Text channel updates during voice conversation
-
 ### Phase 3 Success Criteria
 
-- [ ] **Discord VC**: Bot joins VC, intermediary works through Discord
-- [ ] **Text channel transcript**: Text channel shows full conversation
-- [ ] **Steer via text**: User can type `/steer` in text channel as alternative to voice barge-in
+- [ ] Discord VC: Bot joins VC, intermediary works through Discord
+- [ ] Steer via text: User can type `/steer` as alternative to voice barge-in
 
 ---
 
-## Phase 4: Pipecat Integration (Concurrent Pipeline)
+## Phase 4: WebUI Extension (Optional)
 
-**Goal**: Use Pipecat for concurrent STT+LLM+TTS to minimize latency.
-
-### Milestone 4.1: Pipecat Backend
-- [ ] `audio/pipecat_backend.py` — Pipecat pipeline integration
-- [ ] ParallelPipeline: STT, intermediary LLM, TTS running concurrently
-- [ ] Barge-in via Pipecat's built-in interruption handling
-
-### Milestone 4.2: Latency Optimization
-- [ ] Target: <500ms from user speech end to agent speech start
-- [ ] Compare: LiveKit native vs TEN vs Pipecat latency
+**Goal**: Integrate with hermes-webui as an extension for text-only users.
 
 ### Phase 4 Success Criteria
-
-- [ ] **Pipecat backend works**: `audio.backend: pipecat` → concurrent pipeline
-- [ ] **Sub-500ms latency**: Agent starts responding <500ms after user stops speaking
-
----
-
-## Phase 5: WebUI Extension (Optional)
-
-**Goal**: If needed, integrate with hermes-webui as an extension for users who already use WebUI.
-
-### Phase 5 Success Criteria
 
 - [ ] WebUI extension loads intermediary
 - [ ] Two-pane composer (raw + refined)
@@ -195,45 +156,25 @@
 
 ---
 
-## Phase 6: Hardening & Polish
+## Phase 5: Hardening
 
-### Milestone 6.1: Error Handling
-- [ ] Hermes API unreachable → graceful error message
+### Milestone 5.1: Error Handling
+- [ ] Hermes API unreachable → graceful error
 - [ ] LLM call failures → pass-through mode
 - [ ] LiveKit connection loss → reconnect logic
-- [ ] Rate limit handling
 
-### Milestone 6.2: Observability
-- [ ] Langfuse tracing integration
+### Milestone 5.2: Observability
+- [ ] Langfuse tracing
 - [ ] Per-exchange latency telemetry
-- [ ] Drift event logging
 
-### Milestone 6.3: Documentation
-- [ ] User guide
-- [ ] Developer guide
-- [ ] Configuration reference
+### Milestone 5.3: Documentation
+- [ ] User guide, developer guide, configuration reference
 
-### Phase 6 Success Criteria
+### Phase 5 Success Criteria
 
-- [ ] **Offline recovery**: Hermes unreachable → user hears "Hermes is unavailable"
-- [ ] **Self-diagnostic**: `scripts/doctor.sh` reports status
-- [ ] **No PII in logs**: User messages not logged at INFO level
-
----
-
-## Phase 7: Research & Advanced Features
-
-### Milestone 7.1: Multi-Turn Refinement
-- [ ] Cross-turn pronoun tracking
-- [ ] Reference resolution across 5+ turns
-
-### Milestone 7.2: Proactive Suggestions
-- [ ] Intermediary suggests follow-up questions
-- [ ] Pre-fetch likely needed context
-
-### Milestone 7.3: User Model
-- [ ] Learn preferred communication style
-- [ ] Adapt distillation level per user
+- [ ] Offline recovery: Hermes unreachable → user hears "Hermes is unavailable"
+- [ ] Self-diagnostic: `scripts/doctor.sh` reports status
+- [ ] No PII in logs
 
 ---
 
@@ -244,45 +185,22 @@ A phase is complete when:
 - [ ] Tests passing
 - [ ] Linting clean
 - [ ] Manual E2E test passed (success criteria above)
-- [ ] Video evidence recorded for each platform
+- [ ] Video evidence recorded
 - [ ] Documentation updated
 
 ---
 
 ## External Dependencies
 
-| Dependency | Repo | Status | Use Case |
-|---|---|---|---|
-| LiveKit Agents | [livekit/agents](https://github.com/livekit/agents) | 🆕 New | Agent framework, WebRTC, STT/TTS plugins |
-| LiveKit Server | [livekit/livekit-server](https://github.com/livekit/livekit-server) | 🆕 New | Self-hosted LiveKit server for dev |
-| Hermes WebUI API | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | ✅ Existing | `/api/chat` SSE stream, `/api/sessions` |
-| TEN Framework | [TEN-framework](https://github.com/ten-framework/ten-framework) | 🆕 New | Full-duplex turn detection |
-| TEN Turn Detection | [HuggingFace](https://huggingface.co/TEN-framework/TEN_Turn_Detection) | 🆕 New | Yield-floor detection |
-| Pipecat | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | 🆕 New | Concurrent STT+LLM+TTS pipeline |
-| Playwright | [playwright](https://playwright.dev/) | 🆕 New | Video evidence for frontend/voice tests |
-| Deepgram | [deepgram](https://deepgram.com/) | 🆕 New | STT provider (LiveKit plugin) |
-| Cartesia | [cartesia](https://cartesia.ai/) | 🆕 New | TTS provider (LiveKit plugin) |
-
----
-
-## Hermes API Quick Reference
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/sessions` | POST | Create new session |
-| `/api/sessions` | GET | List sessions |
-| `/api/chat` | POST | Send message → SSE stream |
-| `/api/chat/steer` | POST | Inject steer (alternative: next message) |
-
-### SSE Stream Format
-
-```
-data: {"type": "delta", "content": "First, let me check"}
-
-data: {"type": "tool_use", "tool": "read_file", "args": {"path": "/var/log/syslog"}}
-
-data: {"type": "done"}
-```
+| Dependency | Repo | Purpose |
+|---|---|---|
+| LiveKit Agents | [livekit/agents](https://github.com/livekit/agents) | Agent framework, WebRTC, plugins |
+| LiveKit Server | [livekit/livekit-server](https://github.com/livekit/livekit-server) | Self-hosted dev server |
+| Hermes WebUI | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | `/api/chat` SSE stream |
+| TEN Framework | [TEN-framework](https://github.com/ten-framework/ten-framework) | Turn detection (Phase 2) |
+| Playwright | [playwright](https://playwright.dev/) | Video evidence |
+| Deepgram | [deepgram](https://deepgram.com/) | STT provider |
+| Cartesia | [cartesia](https://cartesia.ai/) | TTS provider |
 
 ---
 
@@ -290,6 +208,29 @@ data: {"type": "done"}
 
 | Skill | What We Took |
 |-------|-------------|
-| `agent-pipeline-intermediary` | Architecture pattern, hook signatures, state management, prompt templates |
-| `deep-think` | Mandatory empirical validation, barge-in state machine design, 5-loop architecture decision |
-| `Playwright` | Video recording of frontend/voice tests for human-verifiable evidence |
+| `agent-pipeline-intermediary` | Architecture pattern, hook signatures, state management |
+| `deep-think` | Mandatory empirical validation, barge-in state machine design |
+| `Playwright` | Video recording of frontend/voice tests |
+
+---
+
+## Hermes API Endpoints
+
+| Endpoint | Method | Purpose | Notes |
+|----------|--------|---------|-------|
+| `/api/sessions` | POST | Create session | On participant connect |
+| `/api/chat/start` | POST | Start run → stream_id | Main entry point |
+| `/api/chat/stream` | GET | SSE deltas | 1-4 chars per delta |
+| `/api/chat/steer` | POST | Inject steer | MUST be called WHILE agent running |
+
+---
+
+## File Paths in hermes-webui
+
+| File | Line | Function |
+|------|------|----------|
+| `api/routes.py` | ~21240 | `_handle_chat_start` |
+| `api/routes.py` | ~12895 | `_handle_session_sse_stream` |
+| `api/streaming.py` | ~10296 | `_handle_chat_steer` |
+
+No changes to these files are required for Phase 1.

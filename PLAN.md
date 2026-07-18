@@ -1,457 +1,1147 @@
-# Intermediary Agent — Complete Plan
+# Intermediary Agent — Complete Implementation Plan
+
+> LiveKit-based intermediary that sits between user and Hermes. Thin voice interface, full text visibility, non-interrupting steer.
+
+---
+
+## Table of Contents
+
+1. [DeepThink Analysis](#deepthink-analysis)
+2. [Architecture Overview](#architecture-overview)
+3. [File Structure](#file-structure)
+4. [Component Design](#component-design)
+5. [Hermes API Integration](#hermes-api-integration)
+6. [LiveKit Integration](#livekit-integration)
+7. [Data Flow](#data-flow)
+8. [Barge-in State Machine](#barge-in-state-machine)
+9. [Session Mapping](#session-mapping)
+10. [Prompt Engineering](#prompt-engineering)
+11. [Frontend (Transcript UI)](#frontend-transcript-ui)
+12. [Test Strategy](#test-strategy)
+13. [Integration Points](#integration-points)
+14. [Performance Requirements](#performance-requirements)
+15. [Security & Privacy](#security--privacy)
+
+---
 
 ## DeepThink Analysis
 
 ### Loop 1 — Surface
-**Problem**: Design a semantic supervisor that sits between human and AI agent.
 
-**Initial hypothesis**: Build a plugin with 3 engines (refine/distill/steer), hook into existing hermes-agent pipeline, add WebUI extension. Reuse `agent.steer()` for corrections. Audio as pluggable sublayer using TEN/Pipecat/LiveKit.
+**Problem**: Design a voice intermediary that lets the user converse with Hermes by voice while watching the full text exchange.
+
+**Initial hypothesis**: Use LiveKit's `VoicePipelineAgent` (high-level class) which chains STT→LLT→TTS automatically. The LLM in the middle is the intermediary. Hermes is called as a function/tool from within the LiveKit agent.
 
 ### Loop 2 — Explore
-**Existing skills/knowledge discovered**:
-- `agent-pipeline-intermediary` skill — exact same problem, with reference implementations for hermes-agent integration and WebUI extension
-- `Playwright (Automation + MCP + Scraper)` — supports video recording of browser tests (frontend evidence)
-- `deep-think` — empirical validation is mandatory for running systems
 
-**Integration patterns from skill**:
-- `intermediate_state.py`: Per-session state management
-- `hooks.py`: Pre-gateway dispatch, pre-LLM call, post-LLM call hook registration
-- `discord_surface.py`: Edit-message pattern for progress updates
-- `webui_extension/intermediary.js`: SSE consumer for real-time intermediary events
+**LiveKit research findings:**
 
-**Audio frameworks**:
-- TEN Turn Detection (open-source, best for turn-taking) — https://github.com/ten-framework/ten-framework
-- Pipecat (BSD-2, concurrent STT+LLM+TTS) — https://github.com/pipecat-ai/pipecat
-- LiveKit (Apache-2, WebRTC browser voice) — https://github.com/livekit/agents
+- `VoicePipelineAgent` is turn-based: LLM turn doesn't end until TTS is done. This makes barge-in awkward.
+- `Agent` + `AgentSession` (lower-level API) supports frame-level streaming — can push chunks to TTS while listening for user speech simultaneously.
+- LiveKit publishes `TranscriptionReceived` events for both user AND agent speech. Frontend subscribes via `room.on(RoomEvent.TranscriptionReceived, ...)`.
+- `LLM Output Replacement` recipe — intercept LLM text before it hits TTS. This is where distillation happens.
+- LiveKit's `FunctionCalling` support — agent can call tools OR forward to external API.
+
+**Hermes research findings:**
+
+- WebUI exposes `POST /api/chat` with SSE streaming (`text/event-stream` with `delta` chunks).
+- WebUI `POST /api/sessions` creates sessions.
+- Gateway exposes `:8642` if `API_SERVER_ENABLED=true`.
+- Existing `/steer` mechanism: `agent.steer(text)` injects into next tool result WITHOUT interruption.
+- Existing `inject_message()` — INTERRUPTS the agent (different!).
+
+**Decision**: Hermes as separate API (option B). NOT a LiveKit tool.
+
+**Why not (A)**:
+- Hermes is an autonomous multi-agent system with memory, toolsets, context compression, sub-agent orchestration.
+- Forcing it into a single function call strips Hermes of its autonomy.
+- The intermediary LLM would have to manage Hermes's reasoning, which is architecturally wrong.
+
+**Why (B)**:
+- LiveKit acts as sensory interface (ears + mouth).
+- Hermes thinks, uses its own tools, streams raw text back to intermediary for distillation.
+- Decoupled: telemetry, debugging, and monitoring are clean.
 
 ### Loop 3 — Challenge
-**What could be wrong with the current approach?**
 
-1. **Steering via `agent.steer()` may not work as expected**
-   - The existing `/steer` is a USER command. Intermediary-side injection may require direct `agent._pending_steer` manipulation.
-   - Need to verify: Can a plugin call `agent.steer()` or does it need `ctx.inject_message()`?
-   - Actually: `ctx.inject_message()` INTERRUPTS. `agent.steer()` does NOT interrupt. We want non-interrupting.
-   - Resolution: Plugin should call `agent.steer()` if accessible, else use `ctx.inject_message()` with `role="user"` and rely on the agent's built-in steer queue.
+**What could go wrong?**
 
-2. **Audio backends may be overkill for MVP**
-   - Phase 1 is text-only. Audio can come later.
-   - BUT: architecture must NOT preclude audio. The `AudioBackend` base class + configuration pattern is correct.
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| Hermes runs a 30-second tool — user hears silence | High | Intermediary says "Working on it..." while waiting for first chunk |
+| Refinement adds latency | Medium | Make refinement part of system prompt (single LLM call), not separate |
+| Distillation quality vs latency tradeoff | Medium | Use fast model (GPT-4o-mini, Gemini Flash) for intermediary; big model for Hermes |
+| Barge-in race condition: Hermes still streaming after user interrupts | High | Track `generation_id` per exchange; increment on barge-in; discard stale chunks |
+| Session state: LiveKit session ≠ Hermes session | Medium | One-to-one mapping: LiveKit participant → Hermes session_id |
+| TTS playback triggers own STT (echo) | Medium | LiveKit has built-in echo cancellation; also mute mic during TTS |
+| Refinement "over-corrects" and changes user intent | High | System prompt: "Preserve intent exactly. Only clarify vagueness, never replace." |
 
-3. **Refine/distill/steer each require LLM calls — latency triple?**
-   - Mitigation: Each engine is small/fast. Refine = single call (user waits). Distill = concurrent with agent. Steer = concurrent with agent.
-   - Total added latency: < 500ms for refine. Distill/steer are concurrent (0 added latency).
+**Critical decision: How to handle Hermes calling.**
 
-4. **Existing hermes-agent `VALID_HOOKS` may not support what we need**
-   - Need to check if `intermediary_*` hooks need to be added, or if we reuse `pre_gateway_dispatch` + `pre_llm_call` + `post_llm_call`.
-   - The `pre_gateway_dispatch` hook gets `event: MessageEvent` BEFORE agent dispatch — perfect for refine.
-   - The `pre_llm_call` hook gets `messages` list — can inject steering.
-   - The `post_llm_call` hook gets `response` — can trigger distillation.
-   - Verdict: NO new hooks needed for Phase 1. Add `intermediary_*` hooks only for external observability.
+The intermediary could:
+1. Call Hermes via LiveKit function calling (agent tool)
+2. Call Hermes via direct HTTP in event handler (no function calling)
+
+Option 2 is simpler and more flexible. The intermediary's event handler calls `hermes_client.send_message()` directly. No need for LiveKit's function calling machinery.
+
+**Decision: Option 2**. Direct HTTP call from event handler.
 
 ### Loop 4 — Synthesize
+
 **Final architecture**:
 
-| Component | Mechanism | Existing/New |
-|-----------|-----------|--------------|
-| Refine engine | `pre_gateway_dispatch` hook → rewrite `event.text` | Existing hook, new handler |
-| Distill engine | `post_llm_call` hook → distill response | Existing hook, new handler |
-| Steer engine | `pre_llm_call` hook → inject into messages (via `agent.steer()` if accessible, else `ctx.inject_message()`) | Existing hook, new handler |
-| State manager | Per-session `IntermediaryState` | New |
-| Discord surface | Edit-message pattern using `DiscordAdapter.edit_message()` | Existing method |
-| WebUI surface | SSE endpoint `/api/intermediary/stream` + two-pane composer | New |
-| Audio sublayer | `AudioBackend` ABC with TEN/Pipecat/LiveKit implementations | New |
+```
+User ←→ (LiveKit WebRTC) ←→ Intermediary Agent ←→ (HTTP/SSE) ←→ Hermes
+  ↕                                                                       ↕
+ Sees text transcript                                              Does reasoning
+ Hears distilled voice                                              Runs tools
+ Can barge-in / steer                                               Returns raw text
+```
 
-### Loop 5 — Convergence
-**Stable**: Yes. Architecture reuses existing hooks, doesn't reinvent steering, pluggable audio, text-first MVP.
+**Refinement**: Built into system prompt. Intermediary LLM sees user text + conversation context. Its first action is to call `hermes_client.send_message()` with the clarified prompt.
+
+**Distillation**: Use LiveKit's `LLM Output Replacement` recipe. Raw Hermes response chunks go through a fast summarizer before being pushed to TTS.
+
+**Steering**: User barges in → `stop_speaking()` → capture text → store as `pending_steer`. When Hermes finishes current step, inject steer as next message prefixed with `[User guidance]`.
+
+**Visibility**: Forward `TranscriptionReceived` events to browser via WebSocket. Frontend renders a live transcript panel.
+
+### Loop 5 — Converge
+
+Architecture is stable. Key principles:
+- Intermediary is thin — no heavy reasoning, just clarity + distillation + routing
+- Hermes stays autonomous — full tool/memory/compression capabilities preserved
+- Text is the visibility layer, voice is the interaction layer
+- LiveKit handles WebRTC, echo cancellation, turn detection
+- Direct HTTP calls to Hermes API (not LiveKit function calling)
+
+---
+
+## Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                              USER                                      │
+│                                                                        │
+│  ┌────────────────┐    LiveKit WebRTC     ┌────────────────────┐      │
+│  │  Microphone    │ ←──────────────────→  │  Speakers          │      │
+│  │  Browser UI    │    ( audio stream )    │  (hear voice)      │      │
+│  │  Transcript    │                        │                    │      │
+│  └────────────────┘                        └────────────────────┘      │
+│         │                                            │                 │
+│         │         ┌──────────────────────────┐       │                 │
+│         │         │    LIVEKIT ROOM          │       │                 │
+│         │         │    (Intermediary Agent)  │       │                 │
+│         │         │                          │       │                 │
+│    STT  │         │  ┌────────────────────┐  │  TTS  │                 │
+│   ─────→│────────→│  │ Intermediary LLM   │  │←──────│                 │
+│         │         │  │ (lightweight)      │  │       │                 │
+│         │         │  │                    │  │       │                 │
+│         │         │  │ • Refine (prompt)  │  │       │                 │
+│         │         │  │ • Distill (filter) │  │       │                 │
+│         │         │  │ • Steer (barge-in) │  │       │                 │
+│         │         │  └─────────┬──────────┘  │       │                 │
+│         │         │            │             │       │                 │
+│         │         │     HTTP POST (SSE)      │       │                 │
+│         │         │            │             │       │                 │
+│         │         └────────────┼─────────────┘       │                 │
+│         │                      │                     │                 │
+│         │                      ↓                     │                 │
+│         │         ┌──────────────────────────┐       │                 │
+│         │         │    HERMES API            │       │                 │
+│         │         │    (separate instance)   │       │                 │
+│         │         │                          │       │                 │
+│         │         │  • Full reasoning        │       │                 │
+│         │         │  • Tools                 │       │                 │
+│         │         │  • Memory                │       │                 │
+│         │         │  • Context compression   │       │                 │
+│         │         │  • Sub-agent编排         │       │                 │
+│         │         └──────────────────────────┘       │                 │
+│         │                                            │                 │
+│         ↓                                            │                 │
+│  ┌─────────────────────────────────────────────┐     │                 │
+│  │  FRONTEND TRANSCRIPT UI                     │     │                 │
+│  │                                             │     │                 │
+│  │  [You] (raw): "um the docker thing?"        │     │                 │
+│  │  [Intermediary]: "Refining: Debug the       │     │                 │
+│  │                Docker permission error"      │     │                 │
+│  │  [Hermes] (raw): "First, let me check..."   │     │                 │
+│  │  [Intermediary] (spoken): "Checking logs"   │     │                 │
+│  │  ...                                        │     │                 │
+│  └─────────────────────────────────────────────┘     │                 │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## File Structure
+
+```
+intermediary-agent/
+├── README.md                       # Project overview, quick start
+├── PLAN.md                         # This file — full implementation plan
+├── ROADMAP.md                      # Phases, milestones, success criteria
+├── INTEGRATION.md                  # External repo file paths + changes
+├── pyproject.toml                  # Python package config
+├── intermediary/
+│   ├── __init__.py
+│   ├── agent.py                    # LiveKit Agent subclass — the intermediary
+│   ├── hermes_client.py            # HTTP client for Hermes API (SSE streaming)
+│   ├── refinement.py               # Refinement logic (system prompt based)
+│   ├── distillation.py             # LLM Output Replacement for Hermes responses
+│   ├── steering.py                 # Barge-in capture + steer injection
+│   ├── session.py                  # Session state management
+│   ├── prompts.py                  # System prompt templates
+│   └── audio_config.py             # Audio backend configuration
+├── audio/
+│   ├── __init__.py
+│   ├── base.py                     # AudioBackend ABC
+│   ├── livekit_native.py           # LiveKit built-in STT/TTS (default)
+│   ├── ten_backend.py              # TEN Turn Detection (full-duplex)
+│   ├── pipecat_backend.py          # Pipecat concurrent pipeline
+│   └── discord_bridge.py           # Discord VoiceReceiver bridge
+├── webui/
+│   ├── __init__.py
+│   ├── app.py                      # FastAPI app serving transcript UI
+│   ├── static/
+│   │   ├── transcript.js           # LiveKit transcription display
+│   │   └── styles.css              # Transcript UI styling
+│   └── templates/
+│       └── index.html              # Transcript UI template
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py                 # Playwright config (video recording)
+│   ├── test_refinement.py          # Refinement unit tests
+│   ├── test_distillation.py        # Distillation unit tests
+│   ├── test_steering.py            # Barge-in + steer tests
+│   ├── test_hermes_client.py       # Hermes API client tests
+│   ├── test_agent.py               # LiveKit agent integration test
+│   ├── test_transcript_ui.py       # Frontend transcript display test
+│   └── test_e2e.py                 # Full E2E test with real Hermes
+├── test-evidence/
+│   ├── videos/                     # Playwright video recordings
+│   └── screenshots/                # Playwright screenshots
+└── scripts/
+    ├── dev.sh                      # Run locally with LiveKit CLI
+    └── doctor.sh                   # Self-diagnostic
+```
 
 ---
 
 ## Component Design
 
-### 1. Refine Engine (`intermediary/refine.py`)
+### 1. Intermediary Agent (`intermediary/agent.py`)
 
 ```python
-class RefineEngine:
-    """Restructure messy user input into actionable prompts."""
+from livekit.agents import Agent, AgentSession
+from livekit.agents.llm import ChatContext
+
+class IntermediaryAgent(Agent):
+    """
+    LiveKit Agent subclass — the intermediary between user and Hermes.
     
-    async def refine(self, raw_text: str, state: IntermediaryState, context: dict) -> str:
+    Responsibilities:
+    - Receive user speech via STT events
+    - Clarify/refine messy input (via system prompt)
+    - Forward refined text to Hermes API via HTTP
+    - Receive Hermes response stream
+    - Distill each chunk for natural speech
+    - Push distilled text to TTS
+    - Handle barge-in (user interrupts while agent is speaking)
+    - Forward transcription events to frontend WebSocket
+    """
+    
+    def __init__(
+        self,
+        hermes_url: str,
+        intermediary_model: str = "openai/gpt-4o-mini",
+        instructions: str = None,
+    ):
+        super().__init__(
+            instructions=instructions or INTERMEDIARY_SYSTEM_PROMPT,
+        )
+        self.hermes_url = hermes_url
+        self.hermes_client = HermesClient(hermes_url)
+        self.session_state: dict[str, SessionState] = {}
+        self.pending_steer: dict[str, str] = {}  # room -> pending steer
+        self.current_generation: dict[str, int] = {}  # room -> generation counter
+    
+    async def on_enter(self):
+        """Called when agent joins the room."""
+        # Get room name / participant info
+        # Create mapping: room -> Hermes session
+    
+    async def on_user_speech_committed(
+        self, session: AgentSession, text: str
+    ):
         """
-        Args:
-            raw_text: User's raw transcript or typed text
-            state: Per-session state (intent_history for pronoun resolution)
-            context: Additional context (platform, conversation history)
+        Called when STT commits user speech.
         
-        Returns:
-            Refined, actionable prompt
+        If user is currently speaking while agent is talking → barge-in.
+        Otherwise → normal turn.
         """
-        # 1. Resolve pronouns using intent_history
-        # 2. Expand vague references
-        # 3. Structure as [Action] + [Context] + [Constraints]
-        # 4. Single LLM call with small model
-        pass
+        room = session.room.name
+        
+        if self._is_barge_in(session):
+            # User interrupted the agent
+            await self._handle_barge_in(session, text)
+        else:
+            # Normal turn
+            await self._handle_user_turn(session, text)
+    
+    async def _handle_user_turn(
+        self, session: AgentSession, text: str
+    ):
+        """
+        Normal user turn: refine → send to Hermes → distill response → speak.
+        """
+        room = session.room.name
+        
+        # 1. Refine (via system prompt — single LLM call)
+        #    The intermediary LLM sees user text + context
+        #    and generates a refined Hermes query
+        
+        # 2. Send to Hermes
+        async for chunk in self.hermes_client.send_message(
+            message=text,
+            session_id=self.session_state[room].hermes_session_id,
+        ):
+            # 3. Distill each chunk
+            distilled = await self.distill(chunk)
+            
+            # 4. Speak
+            session.say(distilled)
+            
+            # 5. Forward to transcript UI
+            self._forward_transcription(room, chunk, "hermes")
+        
+        # 6. After Hermes finishes, check for pending steer
+        if room in self.pending_steer:
+            steer_text = self.pending_steer.pop(room)
+            await self._handle_user_turn(
+                session, f"[User guidance] {steer_text}"
+            )
+    
+    async def _handle_barge_in(
+        self, session: AgentSession, text: str
+    ):
+        """
+        User interrupted the agent mid-speech.
+        
+        - Stop speaking immediately
+        - Capture user text as pending steer
+        - Do NOT restart immediately (let Hermes finish current step)
+        """
+        room = session.room.name
+        
+        # Stop TTS
+        session.stop_speaking()
+        
+        # Capture steer
+        self.pending_steer[room] = text
+        self.current_generation[room] += 1
+        
+        # Forward to transcript UI
+        self._forward_transcription(
+            room, f"[Steer] {text}", "user"
+        )
+    
+    def _is_barge_in(self, session: AgentSession) -> bool:
+        """Check if user is speaking while agent is currently talking."""
+        return session.currently_speaking
+    
+    async def distill(self, raw_chunk: str) -> str:
+        """
+        Distill a raw Hermes response chunk for natural speech.
+        
+        Uses LLM Output Replacement pattern:
+        - Strip chain-of-thought / thinking blocks
+        - Summarize technical output to 1-2 sentences
+        - Keep natural conversational tone
+        """
+        # Fast summarization
+        ...
+    
+    def _forward_transcription(
+        self, room: str, text: str, speaker: str
+    ):
+        """Forward transcription event to frontend via WebSocket."""
+        ...
 ```
 
-**Prompt** (`prompts/refine_system.md`):
-```
-You are an input refinement engine. Restructure messy spoken/typed input into
-a clear, actionable prompt for an AI agent.
-
-Rules:
-1. Preserve the user's original intent exactly
-2. Resolve pronouns using conversation context
-3. Expand vague references ("that thing", "the error") to specific terms
-4. Structure as: [Action] + [Context] + [Constraints]
-5. If the user asks a question, keep it as a question
-6. If the user makes a request, phrase it as a direct instruction
-7. Output ONLY the refined prompt. No preamble, no explanation.
-
-Conversation context: {intent_history}
-Raw input: {raw_input}
-```
-
-### 2. Distill Engine (`intermediary/distill.py`)
+### 2. Hermes API Client (`intermediary/hermes_client.py`)
 
 ```python
-class DistillEngine:
-    """Watch agent's streaming output and produce natural progress updates."""
+import aiohttp
+import json
+from typing import AsyncIterator
+
+class HermesClient:
+    """
+    HTTP client for Hermes WebUI API.
+    
+    Uses SSE streaming to receive response chunks as they are generated.
+    """
+    
+    def __init__(self, base_url: str, api_key: str | None = None):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+    
+    async def create_session(self) -> str:
+        """Create a new Hermes session. Return session_id."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/api/sessions",
+                headers=self._auth_headers(),
+            ) as resp:
+                data = await resp.json()
+                return data["session_id"]
+    
+    async def send_message(
+        self,
+        message: str,
+        session_id: str,
+    ) -> AsyncIterator[str]:
+        """
+        Send a message to Hermes, yield response text chunks.
+        
+        Handles:
+        - SSE stream parsing (data: {...}\n\n format)
+        - Delta chunks (type=delta, content=text)
+        - Tool use chunks
+        - Error chunks
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "message": message,
+                    "session_id": session_id,
+                },
+                headers=self._auth_headers(),
+            ) as resp:
+                async for line in resp.content:
+                    if not line.startswith(b"data: "):
+                        continue
+                    try:
+                        data = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    match data.get("type"):
+                        case "delta":
+                            yield data["content"]
+                        case "tool_use":
+                            # Optionally emit tool-visible chunks
+                            pass
+                        case "error":
+                            yield f"[Error: {data.get('message', 'unknown')}]"
+                        case "done":
+                            return
+    
+    def _auth_headers(self) -> dict:
+        """Build auth headers for Hermes API."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+```
+
+### 3. Refinement Logic (`intermediary/refinement.py`)
+
+Refinement is built into the system prompt. The intermediary LLM sees user text + conversation context. Its first action is to call hermes client with the clarified prompt.
+
+**Option A (chosen)**: System prompt includes refinement instructions. The intermediary LLM does refinement implicitly as part of generating the Hermes query.
+
+**Option B (rejected)**: Separate refinement LLM call. Adds latency.
+
+**System prompt snippet:**
+```
+REFINEMENT RULES:
+- Resolve pronouns ("that thing", "the error") using conversation history
+- Expand vague references to specific terms
+- Structure as: [Action] + [Context] + [Constraints]
+- Output ONLY the refined query. Never add interpretation.
+
+CONVERSATION CONTEXT:
+- Previous topics: {intent_history}
+- Current focus: {current_topic}
+```
+
+### 4. Distillation Logic (`intermediary/distillation.py`)
+
+Distillation uses LiveKit's `LLM Output Replacement` recipe.
+
+```python
+from livekit.agents import llm
+
+class DistillationFilter(llm.Modification():
+    """
+    LiveKit LLM Output Replacement recipe.
+    
+    Intercepts raw Hermes response text before it reaches TTS.
+    Summarizes technical output for natural speech.
+    """
+    
+    def __init__(self, model: str = "openai/gpt-4o-mini"):
+        self.model = model
+    
+    async def modify(
+        self, text: str, context: llm.ChatContext
+    ) -> str:
+        """
+        Transform raw Hermes response chunk into natural speech.
+        
+        Rules:
+        - Strip chain-of-thought / thinking blocks
+        - Summarize to 1-2 sentences
+        - Conversational tone
+        - If nothing useful: return '' (suppress)
+        """
+        # Fast LLM call to summarize
+        ...
+```
+
+**Prompt for distillation (if using LLM):**
+```
+Summarize the following AI agent response for natural speech.
+Output 1-2 sentences, conversational tone, nothing else.
+
+Response: {raw_chunk}
+Summary:
+```
+
+**Heuristic distillation (if not using LLM):**
+- Strip text between `<think>` and `</think>` tags
+- Take first 1-2 sentences
+- Skip markdown formatting
+- Skip tool-use JSON
+
+### 5. Steering Logic (`intermediary/steering.py`)
+
+```python
+class SteeringController:
+    """
+    Manages barge-in capture and steer injection.
+    
+    Lifecycle:
+    1. User is speaking while agent is talking (barge-in detected)
+    2. Agent stops speaking
+    3. User text is stored as pending steer
+    4. Agent finishes current Hermes response
+    5. Pending steer is injected as next user message
+    """
     
     def __init__(self):
-        self.buffer = ""
-        self.last_update = time.monotonic()
+        self.pending_steer: dict[str, str] = {}  # room -> steer text
+        self.steer_history: dict[str, list[str]] = {}  # room -> past steers
     
-    async def on_token(self, token: str, state: IntermediaryState) -> Optional[str]:
-        """
-        Called for each streaming token from agent.
-        
-        Returns:
-            Progress update text, or null if nothing to report.
-        """
-        self.buffer += token
-        
-        # Check if it's time for an update (1-2s cadence)
-        if time.monotonic() - self.last_update > 1.5:
-            update = await self._maybe_summarize(state)
-            if update:
-                self.last_update = time.monotonic()
-                return update
-        return None
+    def capture_steer(self, room: str, text: str):
+        """Called when user barges in."""
+        self.pending_steer[room] = text
+        self.steer_history.setdefault(room, []).append(text)
     
-    async def _maybe_summarize(self, state: IntermediaryState) -> Optional[str]:
-        """Produce a milestone update if there's something to report."""
-        # 1. Check for topic shift or completion
-        # 2. If milestone reached: produce natural 1-sentence update
-        # 3. Otherwise: return null (don't spam)
-        pass
+    def get_pending_steer(self, room: str) -> str | None:
+        """Get and clear pending steer."""
+        return self.pending_steer.pop(room, None)
+    
+    def has_pending_steer(self, room: str) -> bool:
+        return room in self.pending_steer
+    
+    def format_steer_for_hermes(self, text: str) -> str:
+        """Format steer text as a Hermes message."""
+        return f"[User guidance] {text}"
 ```
 
-**Prompt** (`prompts/distill_system.md`):
-```
-You are a progress update generator. Given the agent's streaming output so
-far and the user's original request, produce a single natural-sounding update.
-
-Rules:
-1. ONE sentence. Conversational. Like a colleague updating you.
-2. If the agent is still figuring things out: "Looking into it..." / "Checking..."
-3. If the agent found something: "Found it — [key finding]"
-4. If the agent is going off-ttopic: output "DRIFT" (signal to steering engine)
-5. If nothing useful yet: output null
-
-User intent: {user_intent}
-Agent output: {partial_output}
-
-Output ONLY the update sentence, or null if nothing to report.
-```
-
-### 3. Steer Engine (`intermediary/steer.py`)
+### 6. Session State (`intermediary/session.py`)
 
 ```python
-class SteerEngine:
-    """Detect agent drift and inject corrections mid-turn."""
-    
-    async def check_drift(self, partial_output: str, state: IntermediaryState) -> Optional[str]:
-        """
-        Args:
-            partial_output: Agent's output so far this turn
-            state: Per-session state with drift_baseline
-        
-        Returns:
-            Correction message to inject, or null if aligned.
-        """
-        # 1. Compare topic of partial_output vs drift_baseline
-        # 2. Compute drift_confidence (0.0 to 1.0)
-        # 3. If drift_confidence > threshold: draft correction
-        # 4. Else: return null
-        pass
-    
-    async def inject(self, plugin_ctx: PluginContext, session_id: str, correction: str):
-        """
-        Inject correction into agent's next tool result.
-        NON-interrupting (uses agent.steer() mechanism).
-        """
-        # Option A: If plugin_ctx.steer_agent(session_id, text) exists
-        # Option B: If we have cached agent reference: agent.steer(correction)
-        # Option C: Fallback to ctx.inject_message() (interrupts)
-        pass
-```
+from dataclasses import dataclass, field
 
-**Prompt** (`prompts/steer_system.md`):
-```
-You are a drift detector for an AI agent. Determine if the agent is going
-off-topic compared to what the user originally asked for.
-
-User wanted: {user_intent}
-Agent is talking about: {current_topic}
-
-Rules:
-1. If aligned: output null (no intervention)
-2. If slightly off but productive: output null (let it continue)
-3. If clearly off-topic: output a 1-sentence correction for the agent
-4. Correction should be: "Stay focused on [user_intent]. [Redirect suggestion]"
-
-Output: null | correction text
-```
-
-### 4. State Manager (`intermediary/state.py`)
-
-```python
 @dataclass
-class IntermediaryState:
-    session_id: str
-    user_intent: str = ""           # Resolved user intent (no pronouns)
-    intent_history: list[str] = field(default_factory=list)  # Previous intents for pronoun resolution
-    drift_baseline: str = ""        # What we're checking against for drift
-    current_topic: str = ""         # What the agent is currently discussing
-    steer_injected: bool = False    # Track if we already steered this exchange
-    message_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+class SessionState:
+    """
+    Per-participant session state.
+    Maps LiveKit participant → Hermes session.
+    """
+    room: str
+    participant_identity: str
+    hermes_session_id: str
+    hermes_url: str
+    intent_history: list[str] = field(default_factory=list)
+    current_topic: str = ""
+    current_generation: int = 0
+    
+    def update_intent(self, new_intent: str):
+        """Add new intent to history, update current topic."""
+        self.intent_history.append(new_intent)
+        self.current_topic = new_intent
+        # Keep only last 10 for context window
+        self.intent_history = self.intent_history[-10:]
+    
+    def next_generation(self) -> int:
+        """Increment generation counter (for barge-in invalidation)."""
+        self.current_generation += 1
+        return self.current_generation
 ```
 
-### 5. Hook Registration (`intermediary/hooks.py`)
+### 7. Prompts (`intermediary/prompts.py`)
 
 ```python
-def register_hooks(ctx: PluginContext, intermediary: Intermediary):
-    """Register all Hermes plugin hooks."""
-    
-    @ctx.register_hook("pre_gateway_dispatch")
-    async def on_incoming(event, gateway, session_store):
-        """Refine incoming message before agent dispatch."""
-        if not event.text:
-            return
-        
-        state = intermediary.get_state(event.session_id)
-        refined = await intermediary.refine(event.text, state, {
-            "platform": event.platform.value,
-        })
-        
-        # Store original + refined
-        state.last_raw = event.text
-        state.last_refined = refined
-        state.user_intent = refined  # Update baseline
-        state.intent_history.append(refined)
-        
-        # Show refined via surface
-        await intermediary.surface.send_refined(event, event.text, refined)
-        
-        # Replace event text with refined
-        event.text = refined
-    
-    @ctx.register_hook("pre_llm_call")
-    async def on_before_llm(messages, session_id, **kwargs):
-        """Inject steering message if drift was detected."""
-        state = intermediary.get_state(session_id)
-        if state and state.pending_steering:
-            # Inject via agent.steer() or messages.append()
-            messages.append({
-                "role": "user",
-                "content": f"[User guidance] {state.pending_steering}"
-            })
-            state.pending_steering = None
-    
-    @ctx.register_hook("post_llm_call")
-    async def on_after_llm(response, session_id, **kwargs):
-        """Distill the response and update surface."""
-        state = intermediary.get_state(session_id)
-        if state:
-            summary = await intermediary.distill(response, state)
-            await intermediary.surface.update_progress(summary)
+INTERMEDIARY_SYSTEM_PROMPT = """\
+You are a **thin intermediary** between the user and Hermes (a powerful AI agent).
+
+## Your Role
+
+You are NOT a heavy reasoner. You are the user's ears and mouth:
+- Clarify messy input BEFORE sending to Hermes
+- Distill verbose output for natural speech
+- Handle interruptions gracefully
+
+## Refinement Rules
+
+When the user speaks in fragments or with vague references:
+1. Resolve pronouns using conversation history ("that thing", "the error")
+2. Expand vague references to specific terms
+3. Structure as: [Action] + [Context] + [Constraints]
+4. Output ONLY the refined query. Never add interpretation.
+5. If no refinement needed, pass through unchanged.
+
+## Distillation Rules
+
+When Hermes responds with long technical output:
+1. Summarize to 1-2 sentences for natural speech
+2. Strip chain-of-thought / thinking blocks
+3. Strip markdown formatting
+4. Conversational tone like a colleague updating you
+5. If nothing useful: suppress (don't speak)
+
+## Steering Rules
+
+When the user interrupts (barge-in):
+1. Stop speaking immediately
+2. Capture their correction
+3. After Hermes finishes current step, inject steer as: "[User guidance] <text>"
+4. Do NOT restart immediately — let Hermes finish its current reasoning
+
+## Context
+
+Previous topics: {intent_history}
+Current focus: {current_topic}
+"""
 ```
 
-### 6. Audio Sublayer (`audio/`)
+---
+
+## Hermes API Integration
+
+### Endpoints Used
+
+| Endpoint | Method | Purpose | When |
+|----------|--------|---------|------|
+| `/api/sessions` | POST | Create new Hermes session | On LiveKit participant connect |
+| `/api/sessions` | GET | List active sessions | Diagnostic |
+| `/api/chat` | POST | Send message, receive SSE stream | Every user turn |
+| `/api/chat` | POST | Inject steer | After barge-in |
+| `/api/settings` | GET | Get session settings | Optional |
+
+### SSE Stream Format
+
+```
+data: {"type": "delta", "content": "First, let me check"}
+
+data: {"type": "delta", "content": " the logs."}
+
+data: {"type": "tool_use", "tool": "read_file", "args": {"path": "/var/log/syslog"}}
+
+data: {"type": "delta", "content": "Found the issue!"}
+
+data: {"type": "done"}
+```
+
+### Hermes Response Types
+
+| Type | What to do |
+|------|-----------|
+| `delta` | Pass to distillation → TTS → transcript UI |
+| `tool_use` | Optionally show "Using tool: X" in transcript |
+| `thinking` / `CoT` | Suppress from TTS, optionally show in transcript |
+| `error` | Speak error message, show in transcript |
+| `done` | Check for pending steer, cleanup |
+
+### Session Mapping
+
+```
+LiveKit Room "room-abc-123"
+  └─ Participant "user-sean"
+       └─ SessionState
+            ├─ hermes_session_id: "ses-xyz-789"
+            ├─ intent_history: ["Docker error", "file permissions"]
+            ├─ current_topic: "Docker socket permissions"
+            ├─ current_generation: 4
+            └─ pending_steer: None
+```
+
+---
+
+## LiveKit Integration
+
+### LiveKit Agent Lifecycle
+
+```
+1. Room created
+2. Participant connects (user joins via browser)
+3. IntermediaryAgent.on_enter() → create Hermes session
+4. User speaks → STT → user_speech_committed event
+5. Agent.on_user_speech_committed() → refine → Hermes API
+6. Hermes streams → distill → TTS
+7. User barges in → stop_speaking() → capture steer
+8. Hermes finishes → inject pending steer
+9. User disconnects → on_leave() → cleanup session
+```
+
+### LiveKit Events Used
+
+| Event | Handler | Purpose |
+|-------|---------|---------|
+| `user_speech_committed` | `on_user_speech_committed` | STT text ready → refine + send to Hermes |
+| `agent_speech_committed` | `on_agent_speech_committed` | TTS text ready → forward to UI |
+| `TranscriptionReceived` | Forward to UI | Full visibility |
+| `ParticipantConnected` | `on_participant_connected` | Create Hermes session |
+| `ParticipantDisconnected` | `on_participant_disconnected` | Cleanup |
+| `RoomDisconnected` | `on_room_disconnected` | Cleanup |
+
+### LiveKit Transcription Events
+
+LiveKit publishes `TranscriptionReceived` events containing both user and agent text. Structure:
+
+```json
+{
+    "participant_identity": "user-sean",
+    "text": "um the docker thing?",
+    "is_local": true,
+    "timestamp": 1700000000
+}
+```
+
+```json
+{
+    "participant_identity": "agent-intermediary",
+    "text": "Looking into the Docker permission error",
+    "is_local": false,
+    "timestamp": 1700000005
+}
+```
+
+These are forwarded to the frontend via WebSocket for the transcript UI.
+
+### LiveKit LLM Output Replacement
+
+LiveKit's `LLM Output Replacement` recipe intercepts text before TTS:
 
 ```python
-class AudioBackend(ABC):
-    """Pluggable audio IO for full-duplex voice."""
-    
-    @abstractmethod
-    async def start_listening(self, user_id: str) -> AsyncIterator[bytes]:
-        """Stream raw audio chunks from user microphone."""
-    
-    @abstractmethod
-    async def speak(self, audio: bytes) -> None:
-        """Play audio to user."""
-    
-    @abstractmethod
-    async def stop_speaking(self) -> None:
-        """Barge-in: immediately stop playback when user starts talking."""
-    
-    @abstractmethod
-    async def detect_turn(self, audio_stream) -> AsyncIterator[TurnEvent]:
-        """Yield TurnEvent(is_user_speaking, is_end_of_turn)."""
+from livekit.agents import llm
+
+class DistillationFilter(llm.Modification):
+    async def modify(self, text, context):
+        # Summarize text for natural speech
+        return distilled_text
+
+# Register with agent
+agent = IntermediaryAgent(
+    llm=llm.with_output_replacement(
+        DistillationFilter()
+    )
+)
 ```
-
-**Concrete backends**: `TENAudioBackend`, `PipecatAudioBackend`, `LiveKitAudioBackend`
-
-### 7. Platform Surfaces
-
-#### Discord Surface (`surfaces/discord_surface.py`)
-
-- `send_refined()`: Show `> refined text` as quote-reply to original message
-- `start_progress()`: Create message that will be edited with progress
-- `update_progress()`: Edit the progress message (rate-limited to 500ms)
-- `send_final()`: Replace progress with final summary
-
-#### WebUI Surface (`surfaces/webui_surface.py`)
-
-- SSE bridge to `/api/intermediary/stream`
-- Event types: `refined`, `progress`, `steering`, `final`
 
 ---
 
 ## Data Flow
 
-### Text Path (Phase 1)
+### Normal Turn (User → Hermes → User)
+
 ```
-User types in Discord/CLI/WebUI
-  → pre_gateway_dispatch hook
-    → intermediary.refine(raw_text)
-    → surface.send_refined(raw, refined)
-    → event.text = refined (replace for agent)
-  → Agent processes refined prompt
-  → Streaming response
-    → intermediary.distill() → surface.update_progress()
-    → intermediary.steer.detect() → if drift: agent.steer("redirect")
-  → Agent completes
-    → surface.send_final(summary)
+1. User speaks: "um the docker thing?"
+2. LiveKit STT commits text
+3. IntermediaryAgent.on_user_speech_committed() fires
+4. Refine: "Debug the Docker permission error" (system prompt)
+5. HTTP POST to /api/chat with refined text
+6. Hermes streams response chunks:
+   
+   Chunk 1: "First, let me check the Docker logs..."
+   → Distill: "Checking the Docker logs..."
+   → TTS: "Checking the Docker logs..."
+   → Transcript UI: [Hermes] "First, let me check the Docker logs..."
+   
+   Chunk 2: "I can see a permission denied error on /var/run/docker.sock"
+   → Distill: "Found a permission error on the Docker socket."
+   → TTS: "Found a permission error on the Docker socket."
+   → Transcript UI: [Hermes] "I can see a permission denied error..."
+   
+   Chunk 3: "Run: sudo usermod -aG docker $USER"
+   → Distill: "Run this command to fix it."
+   → TTS: "Run this command to fix it."
+   → Transcript UI: [Hermes] "Run: sudo usermod -aG docker $USER"
+   
+   Chunk 4: {"type": "done"}
+   → Check for pending steer
+   → If none → done
 ```
 
-### Voice Path (Phase 2+)
+### Barge-in Turn (User Steers Mid-Response)
+
 ```
-User speaks in Discord VC
-  → VoiceReceiver captures PCM (existing)
-  → STT via transcription_tools (existing)
-  → raw transcript → intermediary.refine()
-  → Agent processes
-  → Streaming response → intermediary.distill()
-  → Agent completes → TTS → speak in VC
-    → Meanwhile: TEN/Pipecat detects barge-in → stop_speaking() → back to listening
+1. User speaks: "no, the OTHER error"
+2. STT commits text → on_user_speech_committed()
+3. _is_barge_in() returns True (session.currently_speaking)
+4. session.stop_speaking() — cuts TTS immediately
+5. SteeringController.capture_steer(room, "no, the OTHER error")
+6. self.current_generation[room] += 1
+7. Transcript UI: [User] "[Steer] no, the OTHER error"
+8. Hermes continues streaming (chunks are now stale but user doesn't hear them)
+9. Hermes finishes: {"type": "done"}
+10. SteeringController.has_pending_steer() returns True
+11. Inject: "[User guidance] no, the OTHER error"
+12. Hermes receives steer, adjusts course
+13. Hermes streams corrected response
+14. Distill → TTS → transcript UI
 ```
+
+### Bottage-in Timing
+
+| Event | Time (relative) | User Experience |
+|-------|-----------------|-----------------|
+| Agent starts speaking TTS | T=0 | User hears distilled response |
+| User starts speaking (barge-in) | T=X | |
+| VAD detects user speech | T=X+50ms | |
+| `on_user_speech_committed` fires | T=X+200ms | |
+| `session.stop_speaking()` called | T=X+210ms | User hears TTS cut off |
+| STT commits user text | T=X+500ms | |
+| Steer stored | T=X+510ms | Hermes still processing |
+| Hermes finishes current step | T=Y | |
+| Steer injected | T=Y+10ms | Hermes receives correction |
+| Hermes responds to steer | T=Y+500ms | User hears new response |
+
+Target: TTS cut-off within 200ms of user speech onset.
+
+---
+
+## Barge-in State Machine
+
+```
+┌─────────────┐
+│  LISTENING  │ ←─────────────────────────────────────┐
+└──────┬──────┘                                        │
+       │                                               │
+       │ user speech committed                          │
+       │ (refined → Hermes API)                         │
+       ↓                                               │
+┌─────────────┐                                        │
+│  SPEAKING   │                                        │
+│  (Hermes    │                                        │
+│   streaming │                                        │
+│   → TTS)    │                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ user barge-in detected                        │
+       │ (stop_speaking + capture steer)               │
+       ↓                                               │
+┌─────────────┐                                        │
+│  STALE      │                                        │
+│  (Hermes    │                                        │
+│   still     │                                        │
+│   streaming │                                        │
+│   but TTS   │                                        │
+│   stopped)  │                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ Hermes finishes current step                  │
+       │                                               │
+       ↓                                               │
+┌─────────────┐     has pending steer                  │
+│  INJECT     │ ─────────────────────────────────────→ │
+│  (send steer│     no pending steer                   │
+│   to Hermes)│                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ steer sent → back to SPEAKING                 │
+       │                                               │
+       └───────────────────────────────────────────────┘
+```
+
+### Generation ID Tracking
+
+To handle stale chunks after barge-in:
+
+```python
+# Before sending to Hermes
+generation = state.next_generation()
+
+async for chunk in hermes_client.send_message(text, session_id):
+    # If barge-in happened during this stream, chunks are stale
+    if state.current_generation != generation:
+        # Discard stale chunk
+        continue
+    
+    distilled = await distill(chunk)
+    session.say(distilled)
+```
+
+---
+
+## Session Mapping
+
+LiveKit session state differs from Hermes session state:
+
+| LiveKit | Hermes | Mapping |
+|---------|--------|---------|
+| Room name | — | Used as key |
+| Participant identity | — | Used as user identifier |
+| — | session_id | Created on participant connect |
+| `currently_speaking` | — | Used for barge-in detection |
+| Transcription events | — | Forwarded to frontend |
+
+```python
+class SessionManager:
+    """Maps LiveKit participants to Hermes sessions."""
+    
+    def __init__(self, hermes_url: str):
+        self.hermes_client = HermesClient(hermes_url)
+        self.sessions: dict[str, SessionState] = {}  # room+participant -> state
+    
+    async def create_session(
+        self, room: str, participant: str
+    ) -> SessionState:
+        """Create Hermes session for new participant."""
+        hermes_session_id = await self.hermes_client.create_session()
+        state = SessionState(
+            room=room,
+            participant_identity=participant,
+            hermes_session_id=hermes_session_id,
+            hermes_url=self.hermes_client.base_url,
+        )
+        key = self._key(room, participant)
+        self.sessions[key] = state
+        return state
+    
+    def get_session(
+        self, room: str, participant: str
+    ) -> SessionState | None:
+        """Get session for participant."""
+        return self.sessions.get(self._key(room, participant))
+    
+    def _key(self, room: str, participant: str) -> str:
+        return f"{room}:{participant}"
+```
+
+---
+
+## Prompt Engineering
+
+### Intermediary System Prompt
+
+```
+You are a thin intermediary between the user and Hermes (a powerful AI agent).
+
+Your job:
+1. REFINE: When user speaks in fragments or with vague references, clarify their 
+   intent using conversation context before sending to Hermes.
+2. DISTILL: When Hermes responds with long technical output, summarize it naturally 
+   for speech.
+3. STEER: When the user interrupts (barge-in), capture their correction and inject 
+   it into the next exchange.
+
+Rules:
+- Preserve user intent exactly — never change what they're asking for
+- Resolve pronouns ("that thing", "the error") using conversation history
+- Keep distilled output to 1-2 sentences for natural speech
+- If the user interrupts, stop speaking immediately and listen
+- You do NOT do heavy reasoning — that's Hermes's job.
+
+Previous topics: {intent_history}
+Current focus: {current_topic}
+```
+
+### Refinement Examples
+
+| Raw Input | Refined Output | Context Used |
+|-----------|---------------|--------------|
+| "um the docker thing?" | "Debug the Docker permission error" | intent_history contains "Docker permission error" |
+| "no the OTHER one" | "Switch back to the container startup error" | intent_history contains both errors |
+| "ok what about that?" | "Continue discussing the Docker socket permission issue" | current_topic = Docker |
+| "yeah go ahead" | [pass through unchanged] | No vagueness to resolve |
+| "run the thing from before" | "Run `sudo usermod -aG docker $USER` from the previous response" | Refers to prior command |
+
+### Distillation Examples
+
+| Raw Hermes Response | Distilled Output |
+|---------------------|------------------|
+| "First, let me check the Docker logs by reading /var/log/syslog to see if there are any permission-related entries." | "Checking the logs..." |
+| "I can see the error: `permission denied while connecting to Docker daemon socket at unix:///var/run/docker.sock`. This means your user doesn't have access to the Docker socket." | "Found the issue — your user doesn't have access to the Docker socket." |
+| "To fix this, run: `sudo usermod -aG docker $USER && newgrp docker`. This adds your user to the docker group and refreshes group membership." | "Run this command, then try Docker again." |
+| `<think>Let me think about this...</think> The answer is 42. | "The answer is 42." |
+
+---
+
+## Frontend (Transcript UI)
+
+### Layout
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Intermediary Agent — Live Transcript               │
+│                                                       │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │  [You] "um the docker thing?"                   │ │
+│  │  [Intermediary] → "Debug the Docker permission  │ │
+│  │                    error"                       │ │
+│  │  [Hermes] "First, let me check the logs..."     │ │
+│  │  [Speaking] "Checking the logs..."              │ │
+│  │  [Hermes] "Found a permission error..."         │ │
+│  │  [Speaking] "Found a permission error!"         │ │
+│  │  [You] "[Steer] no the OTHER error"             │ │
+│  │  [Intermediary] → "[User guidance] the OTHER   │ │
+│  │                    Docker error"                │ │
+│  │  [Hermes] "Ah, you meant the container          │ │
+│  │           startup error..."                     │ │
+│  │  [Speaking] "Switching to container startup..." │ │
+│  └─────────────────────────────────────────────────┘ │
+│                                                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌────────┐ │
+│  │ 🎙 Mute  │  │ ⏹ Leave  │  │ 🔄 Clear │ │ ⚙      │ │
+│  └──────────┘  └──────────┘  └──────────┘ └────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+### WebSocket Protocol
+
+LiveKit transcript events → intermediary forwards to frontend:
+
+```json
+{
+    "type": "transcript",
+    "speaker": "user",
+    "text": "um the docker thing?",
+    "timestamp": 1700000000
+}
+```
+
+```json
+{
+    "type": "transcript",
+    "speaker": "hermes_raw",
+    "text": "First, let me check the Docker logs...",
+    "timestamp": 1700000005
+}
+```
+
+```json
+{
+    "type": "transcript",
+    "speaker": "agent_speaking",
+    "text": "Checking the Docker logs...",
+    "timestamp": 1700000006
+}
+```
+
+```json
+{
+    "type": "steer",
+    "text": "no the OTHER error",
+    "timestamp": 1700000010
+}
+```
+
+### Frontend Stack
+
+- **React** or vanilla JS (keep it simple)
+- **LiveKit Client SDK** for WebRTC connection
+- **WebSocket** for transcript events
+- **CSS** for styling (dark theme to match WebUI)
 
 ---
 
 ## Test Strategy
 
-### Overview
-
-All tests MUST be empirically validated (per `deep-think` skill). Session transcripts and code-reading over-report bugs by ~5x. We test by running the real system.
-
 ### Test Types
 
 | Type | Tool | Evidence | When |
 |------|------|----------|------|
-| **Unit test** | pytest | Terminal output | Every engine |
-| **Integration test** | pytest + mock hermes-agent | Terminal output | Phase 1.3+ |
-| **Frontend test** | Playwright (headless browser) | Screenshot + video | Phase 4+ |
-| **Voice test** | Playwright + mic simulation | Video + audio recording | Phase 2+ |
-| **Manual E2E** | Human in Discord/WebUI | Video recording (screen capture) | Every phase |
+| Unit test | pytest | Terminal output | Every function |
+| Integration test | pytest + mock Hermes API | Terminal output | Phase 1.2+ |
+| Frontend test | Playwright | Screenshot + video | Phase 1.5+ |
+| Voice test | Playwright + mic / LiveKit test mode | Video recording | Phase 1.6+ |
+| E2E test | Playwright + real Hermes instance | Video recording | Phase 1.8 |
 
-### Video Evidence (per user's request)
+### Empirical Validation
 
-For frontend and voice tests, we record video evidence using Playwright's built-in video recording:
+Per `deep-think` skill: **analysis without running the system is NOT enough**. Every claim about integration behavior must be verified by actually running the components together.
+
+### Video Evidence Requirements
+
+For tests that involve voice or UI:
 
 ```python
-# In Playwright test config:
-browser = await playwright.chromium.launch(
-    record_video_dir="test-evidence/videos/",
-    record_video_size={"width": 1280, "height": 720}
-)
+# conftest.py
+@pytest.fixture
+async def browser():
+    browser = await playwright.chromium.launch(
+        record_video_dir="test-evidence/videos/",
+        record_video_size={"width": 1280, "height": 720}
+    )
+    yield browser
+    await browser.close()
 ```
 
-**Video evidence is stored in**: `test-evidence/videos/{test-name}-{timestamp}.webm`
+Tests record video to `test-evidence/videos/{test-name}-{timestamp}.webm`.
 
-**When to record**:
-- Phase 2+: Voice input tests (show mic → STT → refine → agent response)
-- Phase 4+: WebUI two-pane composer tests (show raw → refined → send → progress)
-- Phase 4+: Discord edit-message pattern tests (show progress being edited in place)
+### Phase 1 Test Plan
 
-### Phase 1 Test Plan (Text-Only)
-
-| Test | Type | Evidence |
-|------|------|----------|
-| Refine engine produces structured prompt | Unit | Terminal |
-| Refine resolves pronouns using history | Unit | Terminal |
-| Distill produces ≤3 updates per exchange | Unit | Terminal |
-| Steer detects drift and injects correction | Unit | Terminal |
-| Hook registration works with mock hermes-agent | Integration | Terminal |
-| Discord surface edits message (not new) | Integration | Terminal |
-| End-to-end: raw → refined → progress → final | Manual E2E | Screen recording |
-
-### Phase 2 Test Plan (Voice)
-
-| Test | Type | Evidence |
-|------|------|----------|
-| VoiceReceiver → STT → refine pipeline | Integration | Terminal |
-| Interim refinement while speaking | Manual E2E | Video |
-| Barge-in: user speaks → agent stops | Manual E2E | Video |
-| Turn detection: agent knows when to yield | Manual E2E | Video |
-
-### Phase 4 Test Plan (WebUI)
-
-| Test | Type | Evidence |
-|------|------|----------|
-| Two-pane composer renders | Playwright | Screenshot |
-| Real-time refinement as user types | Playwright | Video |
-| Sidebar shows progress updates | Playwright | Video |
-| Settings persist across reload | Playwright | Screenshot |
-| Voice button triggers intermediary | Playwright | Video |
+| Test | Type | Evidence | Verifies |
+|------|------|----------|----------|
+| `test_refinement_resolves_pronouns` | Unit | Terminal | "thing" → specific noun |
+| `test_distillation_summarizes_long_response` | Unit | Terminal | 3-paragraph → 1 sentence |
+| `test_hermes_client_parses_sse_stream` | Unit | Terminal | SSE parsing works |
+| `test_barge_in_stops_tts` | Integration | Terminal | stop_speaking called |
+| `test_steer_injected_after_hermes_finishes` | Integration | Terminal | [User guidance] prefix |
+| `test_transcript_ui_updates` | Playwright | Screenshot + video | Transcript shows exchanges |
+| `test_livekit_room_connection` | Playwright | Screenshot + video | User can connect to room |
+| `test_voice_input_triggers_stt` | Playwright | Video | Speech → STT → Hermes query |
+| `test_barge_in_cuts_tts` | Playwright | Video | User speaks → agent stops |
+| `test_e2e_full_conversation` | Playwright | Video | Complete conversation flow |
 
 ---
 
 ## Integration Points
 
-### hermes-agent Changes (minimal)
+### hermes-agent Changes (minimal — NONE for Phase 1)
 
-| File | Change |
-|------|--------|
-| `hermes_cli/plugins.py` | Add `intermediary_*` hooks to `VALID_HOOKS` (for observability) |
-| `hermes_cli/plugins.py` | Add `ctx.steer_agent(session_id, text)` method |
-| `hermes_cli/config.py` | Add `intermediary:` config section |
-| `gateway/platforms/discord.py` | Wire intermediary surface (minimal) |
+Phase 1 uses existing Hermes WebUI API. No changes to hermes-agent or hermes-webui required.
 
-### hermes-webui Changes
+Future phases may need:
+- Expose Hermes API via `API_SERVER_ENABLED` on gateway (for direct gateway access)
+- Add WebSocket support to Hermes for real-time steer injection
 
-| File | Change |
-|------|--------|
-| `static/extension_settings.js` | Register intermediary extension |
-| `static/boot.js` | Intercept STT/text input, refine |
-| `static/ui.js` | Two-pane composer + sidebar |
-| `static/panels.js` | Intermediary preferences |
-| `api/extensions.py` | SSE endpoint |
-| `api/upload.py` | Refine after STT |
+But for Phase 1: **zero changes to existing repos**.
 
----
+### Hermes WebUI Endpoints Used
 
-## External Dependencies
+| Endpoint | Required | Notes |
+|----------|----------|-------|
+| `POST /api/sessions` | Yes | Create session |
+| `POST /api/api/chat` | Yes | Send message, get SSE stream |
+| `POST /api/chat/steer` | Optional | Use if WebSocket injection is preferred over next-message |
 
-| Dependency | Repo | License | Use Case |
-|---|---|---|---|
-| **hermes-agent** | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) | — | Plugin host, agent.steer(), hooks |
-| **hermes-webui** | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | — | Extension host, browser UI |
-| **discord.py** | [Rapptz/discord.py](https://github.com/Rapptz/discord.py) | MIT | Voice IO, edit_message |
-| **TEN Framework** | [TEN-framework](https://github.com/ten-framework/ten-framework) | Open-source | Full-duplex turn detection |
-| **TEN Turn Detection** | [HuggingFace](https://huggingface.co/TEN-framework/TEN_Turn_Detection) | Open-source | Yield-floor detection |
-| **TEN VAD** | [HuggingFace](https://huggingface.co/TEN-framework/ten-vad) | Open-source | Voice activity detection |
-| **Pipecat** | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | BSD-2 | Concurrent STT+LLM+TTS |
-| **LiveKit** | [livekit/agents](https://github.com/livekit/agents) | Apache-2 | WebRTC browser voice |
-| **Langfuse** | [langfuse/langfuse](https://github.com/langfuse/langfuse) | MIT | Observability (optional) |
+### LiveKit Configuration
+
+```bash
+# LiveKit CLI for local development
+livekit-server --dev
+
+# Or LiveKit Cloud (production)
+# Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+```
 
 ---
 
@@ -459,71 +1149,75 @@ browser = await playwright.chromium.launch(
 
 | Metric | Target | Rationale |
 |--------|--------|-----------|
-| Refine latency | < 500ms | Feels instant |
-| Distill update interval | 1-2 seconds | Natural cadence |
-| Steer decision | < 1 second | Catch drift early |
-| Discord edit interval | 500ms | Rate-limit friendly |
+| STT latency | < 200ms | LiveKit STT is fast |
+| Refinement | < 300ms | Single LLM call (system prompt) |
+| First Hermes chunk | < 1s | Network + Hermes init |
+| Distill per chunk | < 200ms | Fast model, small input |
+| TTS latency | < 100ms | Streaming TTS |
 | Barge-in response | < 200ms | User speaks → agent stops |
-| Turn detection | < 100ms | TEN model runs locally |
-| Memory overhead | < 100MB | TEN model + audio buffers |
-| CPU overhead | < 10% | Exclude LLM/agent cost |
+| Echo cancellation | Built-in | LiveKit handles |
+| Turn detection | < 100ms | LiveKit built-in |
+| End-to-end (speak → hear response) | < 2s | Total loop latency |
 
 ---
 
 ## Security & Privacy
 
-- Steer injection uses existing `agent.steer()` — same auth model
-- Audio sublayer streams locally (no cloud audio processing unless configured)
-- TEN model runs locally (no API calls for turn detection)
+- LiveKit WebRTC is encrypted (SRTP)
+- Hermes API calls use existing auth (API key / token)
 - Conversation state (intent_history) stays in-memory per session, never persisted
-- Plugin respects existing `plugins.enabled` opt-in gate
-- No PII in logs at INFO level (only DEBUG + redacted)
+- Transcript UI is local (served by intermediary FastAPI, not public)
+- No PII in intermediary logs at INFO level (only DEBUG + redicated)
 
 ---
 
-## Repo Structure
+## Repo Structure (final)
 
 ```
 intermediary-agent/
-  README.md
-  PLAN.md                    # This file
-  ROADMAP.md
-  INTEGRATION.md
-  intermediary/
-    __init__.py
-    plugin.yaml
-    config.py
-    state.py
-    refine.py
-    distill.py
-    steer.py
-    hooks.py
-  audio/
-    __init__.py
-    base.py
-    ten_backend.py
-    pipecat_backend.py
-    livekit_backend.py
-  surfaces/
-    __init__.py
-    discord_surface.py
-    webui_surface.py
-    cli_surface.py
-  prompts/
-    refine_system.md
-    distill_system.md
-    steer_system.md
-  webui_extension/
-    intermediary.css
-    intermediary.js
-    manifest.json
-  tests/
-    test_refine.py
-    test_distill.py
-    test_steer.py
-    test_hooks.py
-    test_audio_base.py
-  test-evidence/
-    videos/                  # Playwright video recordings
-    screenshots/             # Playwright screenshots
+├── README.md
+├── PLAN.md
+├── ROADMAP.md
+├── INTEGRATION.md
+├── pyproject.toml
+├── intermediary/
+│   ├── __init__.py
+│   ├── agent.py
+│   ├── hermes_client.py
+│   ├── refinement.py
+│   ├── distillation.py
+│   ├── steering.py
+│   ├── session.py
+│   ├── prompts.py
+│   └── audio_config.py
+├── audio/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── livekit_native.py
+│   ├── ten_backend.py
+│   ├── pipecat_backend.py
+│   └── discord_bridge.py
+├── webui/
+│   ├── __init__.py
+│   ├── app.py
+│   ├── static/
+│   │   ├── transcript.js
+│   │   └── styles.css
+│   └── templates/
+│       └── index.html
+├── tests/
+│   ├── conftest.py
+│   ├── test_refinement.py
+│   ├── test_distillation.py
+│   ├── test_steering.py
+│   ├── test_hermes_client.py
+│   ├── test_agent.py
+│   ├── test_transcript_ui.py
+│   └── test_e2e.py
+├── test-evidence/
+│   ├── videos/
+│   └── screenshots/
+└── scripts/
+    ├── dev.sh
+    └── doctor.sh
 ```

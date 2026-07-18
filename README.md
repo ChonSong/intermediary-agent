@@ -1,6 +1,6 @@
 # Intermediary Agent
 
-> A semantic supervisor that sits between you and an AI agent — refining messy input, distilling verbose output, and steering the agent back on track.
+> A LiveKit-based voice intermediary that sits between you and Hermes. Refines messy input, distills verbose output, handles barge-in steering. All visible as text, all conversational by voice.
 
 ---
 
@@ -14,108 +14,100 @@
 
 ## The Solution
 
-An intermediary agent that watches both sides of the conversation:
+A **LiveKit agent** that is the ears and mouth between you and Hermes. It does NOT reason — that Hermes does. The intermediary just clarifies, distills, and routes.
 
 **1. Refine** your messy spoken/typed input into a clear, actionable prompt
 
 > "um the docker thing?" → "Debug the Docker socket permission error from the previous command"
 
-**2. Distill** the agent's verbose streaming output into natural, concise progress updates
+**2. Distill** Hermes' verbose streaming output into natural, concise speech
 
-> Agent streaming 3 paragraphs → Intermediary surfaces: "Found 3 issues. Here's the main one:"
+> Hermes streams 3 paragraphs → Intermediary speaks: "Found 3 issues. Here's the main one:"
 
-**3. Steer** the agent back on track — mid-stream, without stopping the conversation
+**3. Steer** Hermes when you interrupt — mid-turn, without stopping the conversation
 
-> Agent goes off-topic → Intermediary injects: "Stay focused. User wants a fix, not an education."
+> You barge in: "no the OTHER error" → Intermediary captures → injects after Hermes finishes: "[User guidance] no the OTHER error"
 
-All visible. All editable before sending. No TTS required — this is about meaning, not audio.
-
----
+**4. Watch everything** — full text transcript in the browser while you converse by voice
 
 ## How It Works
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
+│                        USER                                      │
 │                                                                  │
-│  YOU                    INTERMEDIARY                    AGENT    │
-│   │                          │                            │      │
-│   │  "um the docker thing"   │                            │      │
-│   ├─────────────────────────>│                            │      │
-│   │                          │  "Debug the Docker socket  │      │
-│   │  [you see: raw → refined]│   permission error"       │      │
-│   │                          ├───────────────────────────>│      │
-│   │                          │                            │      │
-│   │                          │  [streaming output]        │      │
-│   │                          │  "First, let me check      │      │
-│   │                          │   the docs aboutDocker     │      │
-│   │                          │   architecture..."         │      │
-│   │                          │                            │      │
-│   │  "Looking into it..."    │  [distill: progress]       │      │
-│   │  "Found 3 issues, here's │                            │      │
-│   │   the main one"          │  [detect drift: injecting] │      │
-│   │<─────────────────────────┤                            │      │
-│   │                          │  "Stay focused on fix"     │      │
-│   │                          ├───────────────────────────>│      │
-│   │                          │                            │      │
-│   │  "Done. Run this:"       │  [corrected response]      │      │
-│   │<─────────────────────────┤<───────────────────────────┤      │
-│   │                          │                            │      │
+│  ┌─────────────┐    LiveKit WebRTC     ┌──────────────────┐     │
+│  │  Speaks     │ ←──────────────────→  │  Listens         │     │
+│  │  Sees text  │    (voice stream)      │  Hears voice     │     │
+│  │  transcript │                       │                  │     │
+│  └─────────────┘                       └──────────────────┘     │
+│         │                                        │               │
+│         │         ┌─────────────────────┐        │               │
+│         │         │  LIVEKIT AGENT      │        │               │
+│         │         │  (Intermediary)     │        │               │
+│         │         │                     │        │               │
+│    STT  │         │  ┌───────────────┐  │  TTS   │               │
+│   ─────→│────────→│  │ Intermediary  │  │ ──────→│               │
+│         │         │  │ LLM           │  │        │               │
+│         │         │  │ (lightweight) │  │        │               │
+│         │         │  └───────┬───────┘  │        │               │
+│         │         │          │          │        │               │
+│         │         │     HTTP POST (SSE)  │        │               │
+│         │         │          │          │        │               │
+│         │         └──────────┼──────────┘        │               │
+│         │                    │                    │               │
+│         │                    ↓                    │               │
+│         │         ┌─────────────────────┐        │               │
+│         │         │  HERMES WEBUI API   │        │               │
+│         │         │  (separate instance)│        │               │
+│         │         │                     │        │               │
+│         │         │  • Full reasoning   │        │               │
+│         │         │  • Tools            │        │               │
+│         │         │  • Memory           │        │               │
+│         │         │  • Context          │        │               │
+│         │         └─────────────────────┘        │               │
+│         │                                        │               │
+│         ↓                                        │               │
+│  ┌─────────────────────────────────────────┐     │               │
+│  │  TRANSCRIPT UI                          │     │               │
+│  │                                         │     │               │
+│  │  [You] "um the docker thing?"           │     │               │
+│  │  [Intermediary] → "Debug the Docker     │     │               │
+│  │                permission error"        │     │               │
+│  │  [Hermes] "First, let me check..."      │     │               │
+│  │  [Speaking] "Checking the logs..."      │     │               │
+│  │  [You] "[Steer] no the OTHER error"     │     │               │
+│  │  [Hermes] "Ah, you meant the..."        │     │               │
+│  └─────────────────────────────────────────┘     │               │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Architecture
+## Why LiveKit?
 
-This is a **hermes-agent plugin** that registers pipeline middleware, plus a **WebUI extension** for the browser UI.
+| Feature | LiveKit Provides |
+|---------|-----------------|
+| WebRTC transport | Encrypted, low-latency audio |
+| Real-time transcription | Both user AND agent text published to frontend |
+| Barge-in detection | VAD + turn detection built-in |
+| Echo cancellation | Agent doesn't hear itself |
+| Plugin ecosystem | Deepgram STT, Cartesia TTS, OpenAI LLM |
+| LLM Output Replacement | Intercept text before TTS (distillation point) |
 
-```
-hermes-agent                      hermes-webui
-┌─────────────────────┐          ┌─────────────────────┐
-│  Discord adapter    │          │  Two-pane composer  │
-│  Webhook adapter    │          │  Intermediary pane  │
-│       │             │          │       │             │
-│  ┌────┴──────────┐  │          │  ┌────┴──────────┐  │
-│  │  Intermediary  │  │◄═════════►│  WebUI ext     │  │
-│  │  Plugin        │  │   SSE     │                │  │
-│  └────┬──────────┘  │           └────────────────┘  │
-│       │             │                                │
-│  ┌────┴──────────┐  │                                │
-│  │  Refine       │  │                                │
-│  │  Distill      │  │                                │
-│  │  Steer        │  │                                │
-│  └───────────────┘  │                                │
-└─────────────────────┘
-```
+LiveKit gives us the "watch everything" text visibility AND the "converse by voice" interaction from day one.
 
-### Three Engines
+---
 
-| Engine | Input | Output | Latency |
-|--------|-------|--------|---------|
-| **Refine** | Raw user text + conversation context | Structured, actionable prompt | < 500ms |
-| **Distill** | Streaming agent tokens + user intent | Natural progress updates (1-2s cadence) | Concurrent |
-| **Steer** | Streaming output + intent baseline | null (aligned) \| correction injection | < 1s |
+## Three Engines, One Prompt
 
-### Steering: Uses Existing `agent.steer()`
+The intermediary does NOT use separate Python modules for refine/distill/steer. All three are encoded in the **system prompt** of a single lightweight LLM:
 
-The intermediary does NOT reinvent steering. Hermes already has `agent.steer(text)` which injects into the next tool result without interrupting. The intermediary hooks into this:
-
-```python
-# Detect drift → inject correction (non-interrupting)
-agent.steer("Stay focused on fixing the bug")
-# → Next tool result gets "User guidance: Stay focused on fixing the bug"
-# → Agent adjusts course without interruption
-```
-
-### Audio Sublayer: Pluggable from Day One
-
-| Backend | What it does | When to use |
-|---------|-------------|-------------|
-| **TEN Turn Detection** | Yield-floor detection (open-source) | Knowing *when* to speak |
-| **Pipecat Pipeline** | Concurrent STT+LLM+TTS | True full-duplex |
-| **LiveKit Transport** | WebRTC for browser voice | WebUI voice |
-
-Swap via config: `audio.backend: ten` → `audio.backend: pipecat`, no code changes.
+| Engine | Mechanism | Latency |
+|--------|-----------|---------|
+| **Refine** | System prompt: "Clarify messy input before calling tools" | 0ms (implicit in first LLM call) |
+| **Distill** | LLM Output Replacement recipe: intercept Hermes text before TTS | <200ms per chunk |
+| **Steer** | Barge-in detection → capture text → inject after Hermes finishes | <200ms for TTS cut-off |
 
 ---
 
@@ -123,24 +115,9 @@ Swap via config: `audio.backend: ten` → `audio.backend: pipecat`, no code chan
 
 | Platform | Where it lives | What you see |
 |----------|---------------|--------------|
-| **WebUI** | Two-pane composer + sidebar | Raw + refined text; progress updates during agent response |
-| **Discord** | Text channel messages (edit pattern) | Transcribed → refined → progress → final, all in text |
-| **CLI/TUI** | Status line + transcript | Quick progress indicators, refined text before send |
-
----
-
-## Why Not Pipecat / LiveKit / TEN?
-
-| Framework | What it does | Why we don't need it |
-|-----------|--------------|---------------------|
-| **Pipecat** | Voice IO pipeline (STT → LLM → TTS) | We don't do audio output; intermediary refines text |
-| **LiveKit** | WebRTC transport + voice agents | Transport layer; assumes agent output is audio |
-| **TEN Framework** | Full-duplex voice, turn detection | Audio-focused; we're meaning-focused |
-| **Vapi / Retell** | Voice agent SaaS for telephony | Closed-source, phone-focused |
-
-All of these frameworks assume the **output is audio**. We're building a **semantic supervisor** that manages *meaning*. None of them have a concept of "refining input" or "distilling output" — they just pipe audio through.
-
-We might borrow **TEN Turn Detection** later (it's open-source) for knowing when to intervene, but the rest is in-house.
+| **Browser** | LiveKit room + transcript UI | Full text transcript + voice conversation |
+| **Discord** | Voice channel bridge | Text channel transcript + voice conversation |
+| **CLI** | Terminal (future) | Status line + refined display |
 
 ---
 
@@ -148,113 +125,86 @@ We might borrow **TEN Turn Detection** later (it's open-source) for knowing when
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 1 | 🔜 Starting | Hermes-agent plugin (text, Discord) |
-| 2 | 📋 Planned | Voice input (Discord) |
-| 3 | 📋 Planned | Steering engine |
-| 4 | 📋 Planned | WebUI extension |
-| 5 | 📋 Planned | CLI/TUI surface |
+| 0 | ✅ Done | Research, plan, skills loaded |
+| 1 | 🔜 Next | LiveKit agent + Hermes API (MVP) |
+| 2 | 📋 Planned | TEN Turn Detection (full-duplex) |
+| 3 | 📋 Planned | Discord bridge |
+| 4 | 📋 Planned | Pipecat concurrent pipeline |
+| 5 | 📋 Planned | WebUI extension |
 | 6 | 📋 Planned | Hardening |
 
 ### Phase 1 Success Criteria (human-verifiable)
 
-These are tests a human can run — no automated test suite needed to start:
-
-- [ ] **Refine works**: User types "um the docker thing?" → intermediary shows refined "Debug the Docker permission error" before agent sees it
-- [ ] **Edit pattern works**: Progress message in Discord is edited (not new messages), max ~3 updates visible at once
-- [ ] **Latency**: Refined text appears < 1 second after user hits Enter
-- [ ] **Distill works**: Agent's 3-paragraph response → intermediary shows 3 short progress updates then a final summary
-- [ ] **No spam**: Between question and answer, intermediary shows ≤ 5 updates total
-- [ ] **Graceful fallback**: If intermediary is offline, conversation still works normally (pass-through)
-
-See [ROADMAP.md](ROADMAP.md) for all phases' success criteria.
+- [ ] User speaks → STT → refined text sent to Hermes
+- [ ] Hermes response → distilled → TTS speaks
+- [ ] User sees full text transcript in browser
+- [ ] User barge-in → TTS stops → steer injected
+- [ ] Video evidence in `test-evidence/videos/phase1-e2e.webm`
 
 ---
 
-## Integration Points
-
-**hermes-agent** (pipeline hooks):
-| File | Change |
-|------|--------|
-| `hermes_cli/plugins.py` | Add `intermediary_*` hooks to `VALID_HOOKS` |
-| `gateway/platforms/discord.py` | Wire intermediary surface (minimal) |
-| `hermes_cli/config.py` | Add `intermediary:` config section |
-
-**hermes-webui** (extension):
-| File | Change |
-|------|--------|
-| `static/boot.js` | Intercept STT/text input, send to intermediary |
-| `static/ui.js` | Two-pane composer, progress sidebar |
-| `api/extensions.py` | SSE endpoint for intermediary events |
-
-Full integration reference: [INTEGRATION.md](INTEGRATION.md)
-
----
-
-## Repo Structure
-
-```
-intermediary-agent/
-  README.md              # You are here
-  PLAN.md                # Full architecture, component design, prompts
-  ROADMAP.md             # Phases, milestones, success criteria
-  INTEGRATION.md         # File paths, function signatures, code examples
-  intermediary/
-    __init__.py          # Plugin entry (register hooks)
-    plugin.yaml          # Plugin manifest
-    config.py            # Config schema + defaults
-    state.py             # Per-session state (intent, context)
-    refine.py            # Input refinement engine
-    distill.py           # Output distillation engine
-    steer.py             # Drift detection + correction
-    hooks.py             # Hook registration
-  surfaces/
-    discord_surface.py   # Discord renderer
-    webui_surface.py     # WebUI SSE bridge
-    cli_surface.py       # CLI status line
-  prompts/
-    refine_system.md     # "Restructure messy input..."
-    distill_system.md    # "Produce natural progress update..."
-    steer_system.md      # "Detect drift, inject correction..."
-  webui_extension/
-    intermediary.css     # Styles
-    intermediary.js      # Client-side logic
-    manifest.json        # Extension manifest
-  tests/
-    test_refine.py       # Unit + mock LLM tests
-    test_distill.py      # Unit + mock streaming tests
-    test_steer.py        # Drift detection tests
-    test_hooks.py        # Integration tests with hermes-agent mock
-```
-
----
-
-## Using This Repo
-
-### Development
+## Quick Start (Development)
 
 ```bash
-# Clone
-git clone https://github.com/ChonSong/intermediary-agent.git
-cd intermediary-agent
+# Terminal 1: Start LiveKit server
+livekit-server --dev
 
-# Install in hermes-agent plugin directory
-pip install -e hermes-agent  # links to ~/.hermes/plugins/intermediary
+# Terminal 2: Start Hermes WebUI
+cd /home/sc/repos/hermes-webui && python3 bootstrap.py
 
-# Enable in config
-# Add to ~/.hermes/config.yaml:
-#   plugins:
-#     enabled:
-#       - intermediary
+# Terminal 3: Start intermediary agent
+cd /home/sc/intermediary-agent && pip install -e .
+python3 -m intermediary.agent
 
-# Run with hermes-agent
-hermes gateway
+# Terminal 4: Start frontend
+python3 -m webui.app
+
+# Browser: Open http://localhost:8080
 ```
 
-### Documentation
+---
 
-- New contributor? Start with [PLAN.md](PLAN.md) for the full architecture
-- Want to extend? Check [INTEGRATION.md](INTEGRATION.md) for exact code paths
-- Tracking progress? See [ROADMAP.md](ROADMAP.md) for phases and milestones
+## Documentation
+
+| File | Purpose |
+|------|---------|
+| `README.md` | This file — overview, architecture, quick start |
+| `PLAN.md` | Full implementation plan (DeepThink analysis, component design, data flows, test strategy) |
+| `ROADMAP.md` | Phases, milestones, success criteria per phase |
+| `INTEGRATION.md` | Hermes API endpoints, LiveKit events, session mapping, config reference |
+
+---
+
+## Architecture Decisions
+
+### Hermes as Separate API (NOT a LiveKit tool)
+
+Hermes is an autonomous multi-agent system with memory, toolsets, and context compression. Forcing it into a single function call strips it of autonomy. Instead:
+- LiveKit = sensory interface (ears + mouth)
+- Hermes = brain (thinks, uses tools, streams raw text back)
+
+### Steering is User-Initiated (NOT autonomous drift detection)
+
+The intermediary does NOT decide when to intervene. The user does:
+- User: "wait, also check auth.log" → captured as steer
+- User: "no I meant the OTHER error" → captured as steer
+- Intermediary just routes the steer to Hermes via `[User guidance]` prefix
+
+### Zero Changes to Hermes (Phase 1)
+
+Phase 1 uses the existing Hermes WebUI API (`/api/chat`, `/api/sessions`). No modifications to hermes-agent or hermes-webui required.
+
+---
+
+## External Dependencies
+
+| Dependency | Repo | Purpose |
+|---|---|---|
+| LiveKit Agents | [livekit/agents](https://github.com/livekit/agents) | Agent framework, WebRTC, plugins |
+| Hermes WebUI | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | `/api/chat` SSE stream |
+| TEN Framework | [TEN-framework](https://github.com/ten-framework/ten-framework) | Full-duplex turn detection |
+| Pipecat | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | Concurrent STT+LLM+TTS |
+| Playwright | [playwright](https://playwright.dev/) | Video evidence for tests |
 
 ---
 

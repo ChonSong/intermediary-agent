@@ -1,489 +1,631 @@
-# Integration Points
+# Intermediary Agent — Integration Points
 
-> Detailed file paths, function signatures, and links for integrating the intermediary agent with hermes-agent and hermes-webui.
-
----
-
-## External Repositories
-
-| Repo | URL | Description |
-|------|-----|-------------|
-| **hermes-agent** | https://github.com/NousResearch/hermes-agent | Core agent, plugin system, gateway, voice IO |
-| **hermes-webui** | https://github.com/ChonSong/hermes-webui | Browser-based chat UI, extensions, settings |
-| **discord.py** | https://github.com/Rapptz/discord.py | Discord bot library (voice, messaging) |
-| **Langfuse** | https://github.com/langfuse/langfuse | Observability (optional, already integrated) |
+> File paths, API endpoints, and configuration for integrating with Hermes, LiveKit, and external services.
 
 ---
 
-## hermes-Agent Integration
+## Architecture Summary
 
-### 1. Plugin System (`hermes_cli/plugins.py`)
+The intermediary is a **LiveKit Agent** (Python) that connects to Hermes via the existing **WebUI HTTP API**. No changes to hermes-agent or hermes-webui are required for Phase 1.
 
-**Add to `VALID_HOOKS`** (line ~75):
+```
+User ←→ (LiveKit WebRTC) ←→ Intermediary Agent ←→ (HTTP/SSE) ←→ Hermes WebUI
+```
+
+---
+
+## Hermes WebUI Integration
+
+### Endpoints Used
+
+| Endpoint | Method | Purpose | Phase |
+|----------|--------|---------|-------|
+| `/api/sessions` | POST | Create new Hermes session | 1 |
+| `/api/sessions` | GET | List active sessions | 1 |
+| `/api/chat` | POST | Send message, receive SSE stream | 1 |
+| `/api/chat` | POST | Inject steer (as next user message) | 1 |
+| `/api/settings` | GET | Get session settings | 6 |
+
+### SSE Stream Format
+
+```
+data: {"type": "delta", "content": "First, let me check"}
+
+data: {"type": "tool_use", "tool": "read_file", "args": {"path": "/var/log/syslog"}}
+
+data: {"type": "thinking", "content": "Let me think about this..."}
+
+data: {"type": "error", "message": "Something went wrong"}
+
+data: {"type": "done"}
+```
+
+### Hermes Response Types
+
+| Type | What to Do | Distill? |
+|------|-----------|----------|
+| `delta` | Pass to distillation → TTS → transcript UI | Yes |
+| `tool_use` | Show "Using tool: X" in transcript | No (suppress) |
+| `thinking` | Suppress from TTS, optionally show in transcript | No |
+| `error` | Speak error message, show in transcript | Yes |
+| `done` | Check for pending steer, cleanup | No |
+
+### Hermes Session Lifecycle
+
+```
+1. POST /api/sessions → {"session_id": "ses-xyz-789"}
+2. POST /api/chat {"message": "...", "session_id": "ses-xyz-789"} → SSE stream
+3. Multiple messages sent to same session_id
+4. Session persists until timeout or explicit cleanup
+```
+
+### Hermes API Auth
 
 ```python
-VALID_HOOKS: Set[str] = {
-    "pre_tool_call",
-    "post_tool_call",
-    "transform_terminal_output",
-    "transform_tool_result",
-    "pre_llm_call",
-    "post_llm_call",
-    "pre_api_request",
-    "post_api_request",
-    "on_session_start",
-    "on_session_end",
-    "on_session_finalize",
-    "on_session_reset",
-    "subagent_stop",
-    "pre_gateway_dispatch",
-    "pre_approval_request",
-    "post_approval_response",
-    # NEW: intermediary lifecycle
-    "intermediary_refined",      # after intermediary refines input
-    "intermediary_distilled",    # after intermediary distills output  
-    "intermediary_steered",      # after intermediary injects steering
+# If Hermes has auth enabled:
+headers = {"Authorization": f"Bearer {api_key}"}
+
+# If no auth (default for local):
+headers = {}
+```
+
+---
+
+## LiveKit Integration
+
+### LiveKit Agent Lifecycle
+
+```
+1. Room created (via LiveKit server)
+2. Participant connects (user joins via browser)
+3. IntermediaryAgent.on_enter() → create Hermes session
+4. User speaks → STT → user_speech_committed event
+5. Agent.on_user_speech_committed() → refine → Hermes API
+6. Hermes streams → distill → TTS
+7. User barges in → stop_speaking() → capture steer
+8. Hermes finishes → inject pending steer
+9. User disconnects → on_leave() → cleanup session
+```
+
+### LiveKit Events Used
+
+| Event | Handler | Purpose |
+|-------|---------|---------|
+| `user_speech_committed` | `on_user_speech_committed` | STT text ready → refine + send to Hermes |
+| `agent_speech_committed` | `on_agent_speech_committed` | TTS text ready → forward to UI |
+| `TranscriptionReceived` | Forward to UI | Full visibility |
+| `ParticipantConnected` | `on_participant_connected` | Create Hermes session |
+| `ParticipantDisconnected` | `on_participant_disconnected` | Cleanup |
+| `RoomDisconnected` | `on_room_disconnected` | Cleanup |
+
+### LiveKit Transcription Events
+
+LiveKit publishes `TranscriptionReceived` events containing both user and agent text. Structure:
+
+```json
+{
+    "participant_identity": "user-sean",
+    "text": "um the docker thing?",
+    "is_local": true,
+    "timestamp": 1700000000
 }
 ```
 
-**`PluginContext` API** (line ~230):
-
-```python
-class PluginContext:
-    def register_tool(...) -> None: ...
-    def inject_message(content: str, role: str = "user") -> bool: ...
-    def register_cli_command(...) -> None: ...
-    def register_command(...) -> None: ...
-    def dispatch_tool(tool_name: str, args: dict, **kwargs) -> str: ...
-    def register_context_engine(engine) -> None: ...
-    
-    # NEW: intermediary hooks
-    def on_intermediary_event(event: str, data: dict) -> None: ...
-```
-
-### 2. Discord Adapter (`gateway/platforms/discord.py`)
-
-**`DiscordAdapter.__init__`** — Add intermediary state (line ~494):
-
-```python
-class DiscordAdapter(BasePlatformAdapter):
-    def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform.DISCORD)
-        # ...existing code...
-        
-        # NEW: intermediary surface
-        self._intermediary = None  # set by run.py after plugin load
-        self._intermediary_progress_msg = None  # guild_id -> Message
-```
-
-**`edit_message()`** — Already exists (line ~1288), reuse directly:
-
-```python
-async def edit_message(self, message_id: str, new_content: str) -> bool:
-    """Edit an existing Discord message. Used by intermediary for progress updates."""
-    # existing implementation works
-```
-
-**`VoiceReceiver`** — Already exists (line ~121). No modification needed. The intermediary hooks into the existing voice input callback:
-
-```python
-# In run.py or gateway runner:
-adapter._voice_input_callback = intermediary.handle_voice_input
-```
-
-**`_voice_input_callback`** (line ~514):
-
-```python
-self._voice_input_callback: Optional[Callable] = None
-# Called by VoiceReceiver.check_silence() polling loop with:
-#   (guild_id, user_id, wav_path)
-```
-
-### 3. Voice Input (`tools/voice_mode.py`)
-
-**STT Pipeline** — Existing flow:
-
-```
-User speaks → VoiceReceiver → pcm_to_wav() → transcribe_audio() → text
-```
-
-**Intermediary intercept** — Wrap `transcribe_audio`:
-
-```python
-# In intermediary/hooks.py
-async def handle_voice_input(guild_id: str, user_id: str, wav_path: str):
-    # 1. Transcribe (existing)
-    raw = transcribe_audio(wav_path)
-    
-    # 2. Refine (new)
-    refined = await intermediary.refine(raw, state)
-    
-    # 3. Send to agent (existing dispatch)
-    await dispatch_to_agent(guild_id, user_id, refined)
-```
-
-### 4. Config (`hermes_cli/config.py`)
-
-**Add `intermediary:` config section** (alongside `voice:`, `stt:`, `tts:`):
-
-```python
-# In config.py schema:
-INTERMEDIARY_DEFAULTS = {
-    "enabled": False,
-    "features": {
-        "refine": True,
-        "distill": True,
-        "steer": True,
-    },
-    "models": {
-        "refine": "default",
-        "distill": "default", 
-        "steer": "default",
-    },
-    "thresholds": {
-        "drift_confidence": 0.7,
-        "silence_ms": 1800,
-    },
-    "platforms": {
-        "discord": {
-            "edit_interval_ms": 500,
-            "max_update_length": 1800,
-        },
-        "webui": {
-            "stream_mode": "sentence",
-        },
-        "cli": {
-            "spinner": True,
-        },
-    },
+```json
+{
+    "participant_identity": "agent-intermediary",
+    "text": "Looking into the Docker permission error",
+    "is_local": false,
+    "timestamp": 1700000005
 }
 ```
 
-### 5. Gateway Runner (`gateway/run.py` or equivalent)
+These are forwarded to the frontend via WebSocket for the transcript UI.
 
-**Wire intermediary to adapters:**
+### LiveKit LLM Output Replacement
 
-```python
-# In gateway startup:
-for adapter in platform_adapters:
-    if hasattr(adapter, '_intermediary'):
-        adapter._intermediary = intermediary_instance
-```
-
----
-
-## hermes-WebUI Integration
-
-### 1. Extension System (`static/extension_settings.js`)
-
-**Register intermediary extension:**
-
-```javascript
-// In extension_settings.js:
-const INTERMEDIARY_EXTENSION = {
-    id: 'intermediary',
-    name: 'Intermediary',
-    description: 'Semantic supervisor for input refinement and output distillation',
-    version: '0.1.0',
-    author: 'codeovertcp',
-    css: ['/extensions/intermediary/intermediary.css'],
-    js: ['/extensions/intermediary/intermediary.js'],
-    settings: [
-        { key: 'refine_enabled', type: 'boolean', default: true },
-        { key: 'distill_enabled', type: 'boolean', default: true },
-        { key: 'steer_enabled', type: 'boolean', default: true },
-        { key: 'auto_send', type: 'boolean', default: false },
-        { key: 'stream_mode', type: 'enum', options: ['token', 'sentence', 'manual'], default: 'sentence' },
-    ],
-    hooks: [
-        'hermes:pipeline:preSend',
-        'hermes:voice:transcribed',
-        'hermes:agent:token',
-        'hermes:agent:complete',
-    ]
-};
-
-// Register with extension manager
-extensionManager.register(INTERMEDIARY_EXTENSION);
-```
-
-### 2. Voice Pipeline (`static/boot.js`)
-
-**Intercept STT result** (around line 723):
-
-```javascript
-// Existing voice input flow (simplified):
-// _onSpeechResult → form.submit()
-
-// NEW: intermediary intercept
-async function _onSpeechResult(event) {
-    const raw = _extractTranscript(event);
-    
-    // Let intermediary refine
-    const refined = await window._intermediaryRefine(raw);
-    
-    // Update composer with both panes
-    _updateComposerPanes(raw, refined);
-    
-    // If auto-send is enabled, submit after silence
-    if (intermediarySettings.auto_send) {
-        _scheduleAutoSend(refined);
-    }
-}
-```
-
-### 3. Composer UI (`static/index.html`)
-
-**Two-pane composer markup:**
-
-```html
-<!-- Add inside #composer-area -->
-<div id="intermediary-pane" class="intermediary-pane hidden">
-    <div class="intermediary-header">
-        <span class="intermediary-status">Ready</span>
-        <button id="intermediary-toggle" class="intermediary-toggle">⚙</button>
-    </div>
-    <div id="intermediary-raw" class="intermediary-raw" readonly></div>
-    <div id="intermediary-refined" class="intermediary-refined" contenteditable="true"></div>
-</div>
-
-<!-- Sidebar for progress -->
-<aside id="intermediary-sidebar" class="intermediary-sidebar hidden">
-    <h3>Intermediary</h3>
-    <div id="intermediary-updates" class="intermediary-updates"></div>
-</aside>
-```
-
-### 4. Settings Panel (`static/panels.js`)
-
-**Add intermediary preferences:**
-
-```javascript
-// In panels.js settings render:
-const intermediaryHtml = `
-    <div class="setting-group">
-        <label>Refine input
-            <input type="checkbox" id="intermediaryRefineEnabled" data-key="refine_enabled">
-        </label>
-        <label>Distill output
-            <input type="checkbox" id="intermediaryDistillEnabled" data-key="distill_enabled">
-        </label>
-        <label>Steer agent
-            <input type="checkbox" id="intermediarySteerEnabled" data-key="steer_enabled">
-        </label>
-        <label>Auto-send after silence
-            <input type="checkbox" id="intermediaryAutoSend" data-key="auto_send">
-        </label>
-    </div>
-`;
-```
-
-### 5. Backend API (`api/extensions.py`)
-
-**SSE endpoint for intermediary events:**
+LiveKit's `LLM Output Replacement` recipe intercepts text before TTS:
 
 ```python
-# In api/extensions.py:
-from fastapi import APIRouter, Request
-from sse_starlette.sse import EventSourceResponse
+from livekit.agents import llm
 
-intermediary_router = APIRouter()
+class DistillationFilter(llm.Modification):
+    async def modify(self, text, context):
+        # Summarize text for natural speech
+        return distilled_text
 
-@intermediary_router.get("/api/intermediary/stream")
-async def intermediary_stream(request: Request):
-    """SSE stream for intermediary events."""
-    async def event_generator():
-        queue = asyncio.Queue()
-        # Register queue with intermediary
-        intermediary.register_webui_queue(queue)
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                event = await asyncio.wait_for(queue.get(), timeout=30)
-                yield {"event": event["type"], "data": json.dumps(event["data"])}
-        except asyncio.TimeoutError:
-            yield {"event": "ping", "data": "{}"}
-    return EventSourceResponse(event_generator())
-```
-
-### 6. Transcription API (`api/upload.py`)
-
-**Refine after STT** (line ~435):
-
-```python
-# In handle_transcribe:
-def handle_transcribe(handler):
-    # ...existing: receive file, save to temp...
-    
-    # Existing: transcribe
-    result = transcribe_audio(temp_path)
-    raw_transcript = result["transcript"]
-    
-    # NEW: refine if intermediary is enabled
-    if intermediary_enabled():
-        refined = intermediary.refine(raw_transcript)
-        result["refined"] = refined
-    
-    # Return both raw and refined
-    send_response(200, result)
-```
-
----
-
-## Data Flow Summary
-
-```
-DISCORD VOICE:
-  VoiceReceiver._on_packet()
-    → VoiceReceiver.check_silence()
-      → _voice_input_callback()
-        → intermediary.handle_voice_input()
-          → transcribe_audio()  [STT]
-          → intermediary.refine()
-          → DiscordSurface.send_refined()
-          → dispatch_to_agent()  [existing]
-            → Agent streams response
-              → intermediary.distill()
-                → DiscordSurface.update_progress()
-              → intermediary.steer() [if drift]
-                → ctx.inject_message()
-              → Agent completes
-                → DiscordSurface.send_final()
-
-DISCORD TEXT:
-  DiscordAdapter.on_message()
-    → _voice_input_callback()  [or _text_input_callback]
-      → intermediary.refine()
-      → DiscordSurface.send_refined()
-      → dispatch_to_agent()
-        → [same distillation/steering as above]
-
-WEBUI TEXT:
-  _onSpeechResult() / form.submit()
-    → intermediary.refine()  [via JS API]
-    → _updateComposerPanes()
-    → [user edits if needed]
-    → form.submit()
-      → POST /api/chat  [existing]
-        → Agent streams response
-          → intermediary.distill()  [via SSE]
-            → intermediary.sidebar.update()
-
-CLI:
-  _read_input()
-    → intermediary.refine()
-    → CLISurface.show_refined()
-    → agent.chat()
-      → [same distillation/steering as above]
-```
-
----
-
-## Files Created / Modified
-
-### New Files (in this repo)
-
-```
-intermediary-agent/
-  README.md
-  PLAN.md
-  ROADMAP.md
-  INTEGRATION.md              # This file
-  intermediary/
-    __init__.py               # register() entry
-    plugin.yaml               # Plugin manifest
-    config.py                 # Config schema
-    state.py                  # IntermediaryState
-    refine.py                 # Refine engine
-    distill.py                # Distill engine  
-    steer.py                  # Steer engine
-    hooks.py                  # Hook registration
-  surfaces/
-    __init__.py
-    discord_surface.py        # Discord renderer
-    webui_surface.py          # WebUI SSE bridge
-    cli_surface.py            # CLI status line
-  prompts/
-    refine_system.md          # Refinement prompt
-    distill_system.md         # Distillation prompt
-    steer_system.md           # Steering prompt
-  webui_extension/
-    intermediary.css          # Styles
-    intermediary.js           # Client logic
-    manifest.json             # Extension manifest
-  tests/
-    test_state.py
-    test_refine.py
-    test_distill.py
-    test_steer.py
-    test_hooks_integration.py
-    test_discord_surface.py
-    test_webui_surface.py
-    test_cli_surface.py
-```
-
-### Modified Files (in hermes-agent/hermes-webui)
-
-```
-hermes-agent/
-  hermes_cli/plugins.py           # Add intermediary hooks to VALID_HOOKS
-  gateway/platforms/discord.py    # Wire intermediary surface (minimal)
-  hermes_cli/config.py            # Add intermediary: config section
-  gateway/run.py                  # Connect intermediary to adapters
-    
-hermes-webui/
-  static/extension_settings.js    # Register intermediary extension
-  static/boot.js                  # Intercept voice input, refine
-  static/ui.js                    # Two-pane composer rendering
-  static/panels.js                # Intermediary preferences
-  static/index.html               # Composer markup + sidebar
-  api/extensions.py               # SSE endpoint
-  api/upload.py                   # Refine after STT
-```
-
----
-
-## Quick Reference: Hermes-Agent Plugin API
-
-### Hooks (lifecycle callbacks)
-
-```python
-def register_hook(self, name: str, callback: Callable) -> None:
-    """Register a callback for a specific hook."""
-
-# Example:
-ctx.register_hook("pre_gateway_dispatch", my_callback)
-ctx.register_hook("on_session_start", my_session_start)
-```
-
-### Context Injection
-
-```python
-ctx.inject_message("Stay focused on the fix", role="user")
-# → Injects a message into the active conversation
-# → If agent is mid-turn, interrupts and injects
-# → If agent is idle, queues as next input
-```
-
-### Tool Registration
-
-```python
-ctx.register_tool(
-    name="my_tool",
-    toolset="my_plugin",
-    schema={"type": "object", "properties": {...}},
-    handler=my_handler,
+# Register with agent
+agent = IntermediaryAgent(
+    llm=llm.with_output_replacement(
+        DistillationFilter()
+    )
 )
 ```
 
-### Slash Commands
+### LiveKit Configuration
+
+```bash
+# Local development
+livekit-server --dev
+
+# Or LiveKit Cloud (production)
+# Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+```
+
+### LiveKit Room Configuration
 
 ```python
-ctx.register_command(
-    name="mymodal",
-    handler=my_command_handler,
-    description="Short description",
-    args_hint="<file>",
+# In agent.py
+room_options = RoomOptions(
+    enable_audio=True,
+    enable_video=False,  # Audio only for now
+    empty_timeout=300,   # 5 min empty room timeout
 )
 ```
+
+---
+
+## Audio Sublayer Integration
+
+### AudioBackend ABC
+
+```python
+class AudioBackend(ABC):
+    """Pluggable audio IO for full-duplex voice."""
+    
+    @abstractmethod
+    async def start_listening(self, user_id: str) -> AsyncIterator[bytes]:
+        """Stream raw audio chunks from user microphone."""
+    
+    @abstractmethod
+    async def speak(self, audio: bytes) -> None:
+        """Play audio to user."""
+    
+    @abstractmethod
+    async def stop_speaking(self) -> None:
+        """Barge-in: immediately stop playback when user starts talking."""
+    
+    @abstractmethod
+    async def detect_turn(self, audio_stream) -> AsyncIterator[TurnEvent]:
+        """Yield TurnEvent(is_user_speaking, is_end_of_turn)."""
+```
+
+### Backend Implementations
+
+| Backend | Transport | Phase | Config |
+|---------|-----------|-------|--------|
+| `LiveKitNativeAudio` | WebRTC | 1 | `audio.backend: livekit` |
+| `TENAudioBackend` | WebRTC + TEN Turn Detection | 2 | `audio.backend: ten` |
+| `PipecatAudioBackend` | WebSocket | 4 | `audio.backend: pipecat` |
+| `DiscordAudioBridge` | Discord VC | 3 | `audio.backend: discord` |
+
+### TEN Turn Detection Integration
+
+```python
+# audio/ten_backend.py
+class TENAudioBackend(AudioBackend):
+    """Full-duplex audio using TEN Framework for turn detection."""
+    
+    def __init__(self):
+        # Load TEN Turn Detection model from HuggingFace
+        self.turn_detector = TEN_Turn_Detection.from_pretrained(
+            "TEN-framework/TEN_Turn_Detection"
+        )
+    
+    async def detect_turn(self, audio_stream):
+        """Use TEN's model to detect when user is done speaking."""
+        async for chunk in audio_stream:
+            result = self.turn_detector.predict(chunk)
+            yield TurnEvent(
+                is_user_speaking=result.is_speaking,
+                is_end_of_turn=result.is_end_of_turn,
+                should_yield_floor=result.should_yield
+            )
+```
+
+### Audio Config
+
+```yaml
+# config.yaml
+audio:
+  backend: livekit    # livekit | ten | pipecat | discord
+  barge_in: true
+  turn_detection: true
+  stt:
+    provider: deepgram  # deepgram | openai | google
+    model: nova-3
+  tts:
+    provider: cartesia  # cartesia | openai | elevenlabs
+    model: sonic-3
+```
+
+---
+
+## Frontend Integration
+
+### WebSocket Protocol
+
+LiveKit transcript events → intermediary forwards to frontend:
+
+```json
+{
+    "type": "transcript",
+    "speaker": "user",
+    "text": "um the docker thing?",
+    "timestamp": 1700000000
+}
+```
+
+```json
+{
+    "type": "transcript",
+    "speaker": "hermes_raw",
+    "text": "First, let me check the Docker logs...",
+    "timestamp": 1700000005
+}
+```
+
+```json
+{
+    "type": "transcript",
+    "speaker": "agent_speaking",
+    "text": "Checking the Docker logs...",
+    "timestamp": 1700000006
+}
+```
+
+```json
+{
+    "type": "steer",
+    "text": "no the OTHER error",
+    "timestamp": 1700000010
+}
+```
+
+### Frontend Stack
+
+- **React** or vanilla JS (keep it simple)
+- **LiveKit Client SDK** for WebRTC connection
+- **WebSocket** for transcript events
+- **CSS** for styling (dark theme to match WebUI)
+
+### Frontend Layout
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Intermediary Agent — Live Transcript               │
+│                                                       │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │  [You] "um the docker thing?"                   │ │
+│  │  [Intermediary] → "Debug the Docker permission  │ │
+│  │                    error"                       │ │
+│  │  [Hermes] "First, let me check the logs..."     │ │
+│  │  [Speaking] "Checking the logs..."              │ │
+│  │  ...                                            │ │
+│  └─────────────────────────────────────────────────┘ │
+│                                                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌────────┐ │
+│  │ 🎙 Mute  │  │ ⏹ Leave  │  │ 🔄 Clear │ │ ⚙      │ │
+│  └──────────┘  └──────────┘  └──────────┘ └────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Session Mapping
+
+### LiveKit ↔ Hermes Session
+
+```
+LiveKit Room "room-abc-123"
+  └─ Participant "user-sean"
+       └─ SessionState
+            ├─ hermes_session_id: "ses-xyz-789"
+            ├─ intent_history: ["Docker error", "file permissions"]
+            ├─ current_topic: "Docker socket permissions"
+            ├─ current_generation: 4
+            └─ pending_steer: None
+```
+
+### Session Manager
+
+```python
+class SessionManager:
+    """Maps LiveKit participants to Hermes sessions."""
+    
+    def __init__(self, hermes_url: str):
+        self.hermes_client = HermesClient(hermes_url)
+        self.sessions: dict[str, SessionState] = {}  # room+participant -> state
+    
+    async def create_session(
+        self, room: str, participant: str
+    ) -> SessionState:
+        """Create Hermes session for new participant."""
+        hermes_session_id = await self.hermes_client.create_session()
+        state = SessionState(
+            room=room,
+            participant_identity=participant,
+            hermes_session_id=hermes_session_id,
+            hermes_url=self.hermes_client.base_url,
+        )
+        key = self._key(room, participant)
+        self.sessions[key] = state
+        return state
+    
+    def get_session(
+        self, room: str, participant: str
+    ) -> SessionState | None:
+        """Get session for participant."""
+        return self.sessions.get(self._key(room, participant))
+    
+    def _key(self, room: str, participant: str) -> str:
+        return f"{room}:{participant}"
+```
+
+---
+
+## Configuration
+
+### Full Configuration Reference
+
+```yaml
+# config.yaml
+
+# Intermediary configuration
+intermediary:
+  enabled: true
+  hermes_url: "http://localhost:3000"  # Hermes WebUI URL
+  hermes_api_key: null                 # Hermes API key (if auth enabled)
+  
+  # Model configuration
+  models:
+    intermediary: "openai/gpt-4o-mini"  # Lightweight model for intermediary
+    distillation: "openai/gpt-4o-mini"  # Model for distillation
+  
+  # Feature toggles
+  features:
+    refine: true      # Enable input refinement
+    distill: true     # Enable output distillation
+    steer: true       # Enable barge-in steering
+  
+  # Thresholds
+  thresholds:
+    drift_confidence: 0.7  # NOT USED — steering is user-initiated
+    silence_ms: 1800       # For voice input
+    max_steer_per_exchange: 1
+  
+  # Audio configuration
+  audio:
+    backend: livekit    # livekit | ten | pipecat | discord
+    barge_in: true
+    turn_detection: true
+    stt:
+      provider: deepgram
+      model: nova-3
+    tts:
+      provider: cartesia
+      model: sonic-3
+  
+  # Platform-specific
+  platforms:
+    discord:
+      edit_interval_ms: 500
+      max_update_length: 1800
+    webui:
+      stream_mode: "sentence"
+    cli:
+      spinner: true
+
+# LiveKit configuration
+livekit:
+  url: "ws://localhost:7880"
+  api_key: "devkey"
+  api_secret: "secret"
+
+# Frontend configuration
+frontend:
+  host: "0.0.0.0"
+  port: 8080
+  cors_origins: ["http://localhost:3000", "http://localhost:8080"]
+```
+
+---
+
+## External Dependencies
+
+### Python Packages
+
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+    "livekit-agents>=0.12.0",
+    "livekit-plugins-deepgram>=0.6.0",    # STT
+    "livekit-plugins-cartesia>=0.4.0",    # TTS
+    "livekit-plugins-openai>=0.10.0",     # OpenAI LLM
+    "livekit-plugins-silero>=0.7.0",      # VAD
+    "aiohttp>=3.9.0",                     # HTTP client for Hermes API
+    "fastapi>=0.110.0",                   # Frontend server
+    "uvicorn>=0.27.0",                    # ASGI server
+    "websockets>=12.0",                   # WebSocket for frontend
+    "pydantic>=2.6.0",                    # Config validation
+    "python-dotenv>=1.0.0",               # Env var loading
+]
+
+[project.optional-dependencies]
+ten = ["torch>=2.0.0", "transformers>=4.30.0"]  # TEN Turn Detection
+pipecat = ["pipecat-ai>=0.0.0"]                  # Pipecat pipeline
+discord = ["discord.py[voice]>=2.3.0"]           # Discord bridge
+test = ["pytest>=8.0.0", "playwright>=1.40.0"]   # Testing
+```
+
+### External Services
+
+| Service | Provider | Purpose | Phase |
+|---------|----------|---------|-------|
+| LiveKit Server | [livekit/livekit-server](https://github.com/livekit/livekit-server) | WebRTC server | 1 |
+| Deepgram | [deepgram](https://deepgram.com/) | STT | 1 |
+| Cartesia | [cartesia](https://cartesia.ai/) | TTS | 1 |
+| OpenAI | [openai](https://openai.com/) | Intermediary LLM | 1 |
+| Hermes WebUI | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | Agent API | 1 |
+| TEN Turn Detection | [HuggingFace](https://huggingface.co/TEN-framework/TEN_Turn_Detection) | Turn detection | 2 |
+| Pipecat | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | Concurrent pipeline | 4 |
+| Discord | [discord.py](https://github.com/Rapptz/discord.py) | Voice channel bridge | 3 |
+
+---
+
+## Development Workflow
+
+### Local Development
+
+```bash
+# Terminal 1: Start LiveKit server
+livekit-server --dev
+
+# Terminal 2: Start Hermes WebUI (if not already running)
+cd /home/sc/repos/hermes-webui
+python3 bootstrap.py
+
+# Terminal 3: Start intermediary agent
+cd /home/sc/intermediary-agent
+python3 -m intermediary.agent
+
+# Terminal 4: Start frontend
+cd /home/sc/intermediary-agent
+python3 -m webui.app
+
+# Browser: Open http://localhost:8080
+```
+
+### Testing
+
+```bash
+# Unit tests
+pytest tests/test_refinement.py tests/test_distillation.py -v
+
+# Integration tests (requires LiveKit + Hermes running)
+pytest tests/test_agent.py -v
+
+# Frontend tests with video evidence
+pytest tests/test_transcript_ui.py --video=on
+
+# E2E test
+pytest tests/test_e2e.py --video=on
+```
+
+### Self-Diagnostic
+
+```bash
+# Check all components are working
+./scripts/doctor.sh
+
+# Expected output:
+# ✓ LiveKit server reachable
+# ✓ Hermes WebUI reachable
+# ✓ STT provider (Deepgram) configured
+# ✓ TTS provider (Cartesia) configured
+# ✓ Intermediary LLM (OpenAI) configured
+# ✓ Frontend server running
+```
+
+---
+
+## Key Hermes-Agent Code Paths (for reference)
+
+| Purpose | File | Symbol |
+|---------|------|--------|
+| Plugin registration | `hermes_cli/plugins.py` | `PluginContext.register()` |
+| Hook invocation | `hermes_cli/plugins.py` | `invoke_hook(name, **kwargs)` |
+| Pre-dispatch hook | `hermes_cli/plugins.py` | `VALID_HOOKS` includes `pre_gateway_dispatch` |
+| Message injection | `hermes_cli/plugins.py` | `ctx.inject_message(content, role)` |
+| Discord adapter | `gateway/platforms/discord.py` | `class DiscordAdapter` |
+| Voice receiver | `gateway/platforms/discord.py` | `class VoiceReceiver` |
+| Discord edit | `gateway/platforms/discord.py` | `async def edit_message()` |
+| Voice STT | `tools/transcription_tools.py` | `transcribe_audio(file_path)` |
+| Voice mode | `tools/voice_mode.py` | Voice mode state machine |
+| Config schema | `hermes_cli/config.py` | `load_config()`, `cfg_get()` |
+
+---
+
+## Key Hermes-WebUI Code Paths (for reference)
+
+| Purpose | File | What to Add |
+|---|---|---|
+| Extension hookup | `static/extension_settings.js` | Register intermediary extension |
+| Composer UI | `static/index.html` | Two-pane composer markup |
+| Voice pipeline | `static/boot.js` | Intermediary intercept after STT |
+| Agent streaming | `static/ui.js` | Token-level intermediary events |
+| Settings UI | `static/panels.js` | Intermediary preferences/toggles |
+| Backend API | `api/extensions.py` | `/api/intermediary/stream` SSE |
+| Settings persistence | `api/config.py` | `intermediary:` config section |
+
+---
+
+## Barge-in State Machine
+
+```
+┌─────────────┐
+│  LISTENING  │ ←─────────────────────────────────────┐
+└──────┬──────┘                                        │
+       │                                               │
+       │ user speech committed                          │
+       │ (refined → Hermes API)                         │
+       ↓                                               │
+┌─────────────┐                                        │
+│  SPEAKING   │                                        │
+│  (Hermes    │                                        │
+│   streaming │                                        │
+│   → TTS)    │                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ user barge-in detected                        │
+       │ (stop_speaking + capture steer)               │
+       ↓                                               │
+┌─────────────┐                                        │
+│  STALE      │                                        │
+│  (Hermes    │                                        │
+│   still     │                                        │
+│   streaming │                                        │
+│   but TTS   │                                        │
+│   stopped)  │                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ Hermes finishes current step                  │
+       │                                               │
+       ↓                                               │
+┌─────────────┐     has pending steer                  │
+│  INJECT     │ ─────────────────────────────────────→ │
+│  (send steer│     no pending steer                   │
+│   to Hermes)│                                        │
+└──────┬──────┘                                        │
+       │                                               │
+       │ steer sent → back to SPEAKING                 │
+       │                                               │
+       └───────────────────────────────────────────────┘
+```
+
+---
+
+## Performance Requirements
+
+| Metric | Target | Rationale |
+|--------|--------|-----------|
+| STT latency | < 200ms | LiveKit STT is fast |
+| Refinement | < 300ms | Single LLM call (system prompt) |
+| First Hermes chunk | < 1s | Network + Hermes init |
+| Distill per chunk | < 200ms | Fast model, small input |
+| TTS latency | < 100ms | Streaming TTS |
+| Barge-in response | < 200ms | User speaks → agent stops |
+| Echo cancellation | Built-in | LiveKit handles |
+| Turn detection | < 100ms | LiveKit built-in |
+| End-to-end (speak → hear response) | < 2s | Total loop latency |
+
+---
+
+## Security & Privacy
+
+- LiveKit WebRTC is encrypted (SRTP)
+- Hermes API calls use existing auth (API key / token)
+- Conversation state (intent_history) stays in-memory per session, never persisted
+- Transcript UI is local (served by intermediary FastAPI, not public)
+- No PII in intermediary logs at INFO level (only DEBUG + redacted)

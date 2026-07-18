@@ -126,15 +126,18 @@ All three behaviors are encoded in the **system prompt** of the intermediary LLM
 | 1 | 🔜 Next | LiveKit agent + Hermes API (MVP) |
 | 2 | 📋 Planned | TEN Turn Detection (better barge-in) |
 | 3 | 📋 Planned | Discord bridge |
-| 4 | 📋 Planned | WebUI extension |
+| 4 | 📋 Planned | Pipecat concurrent pipeline |
 
-### Phase 1 Success Criteria (human-verifiable)
+### Phase 1 Sessions
 
-- [ ] User speaks → STT → refined text sent to Hermes
-- [ ] Hermes response → distilled → TTS speaks
-- [ ] User sees full text transcript in browser
-- [ ] User barge-in → TTS stops → steer injected IMMEDIATELY (before SSE ends)
-- [ ] Video evidence in `test-evidence/videos/phase1-e2e.webm`
+| Session | Focus |
+|---------|-------|
+| 1 | Core scaffolding + mock Hermes server |
+| 2 | Text distillation + logic verification |
+| 3 | State-steering engine (barge-in + async sync) |
+| 4 | Real Hermes WebUI pipeline integration |
+| 5 | Voice + UI layer |
+| 6 | Telemetry, verification + video |
 
 ---
 
@@ -200,8 +203,11 @@ SSE deltas are 1-4 characters. You cannot pass sub-word tokens to an LLM for rew
 |---|---|---|
 | LiveKit Agents | [livekit/agents](https://github.com/livekit/agents) | Agent framework, WebRTC, plugins |
 | Hermes WebUI | [ChonSong/hermes-webui](https://github.com/ChonSong/hermes-webui) | `/api/chat` SSE stream |
+| Playwright | [playwright](https://playwright.dev/) | Video evidence for frontend/voice tests |
+| Deepgram | [deepgram](https://deepgram.com/) | STT provider |
+| Cartesia | [cartesia](https://cartesia.ai/) | TTS provider |
 | TEN Framework | [TEN-framework](https://github.com/ten-framework/ten-framework) | Turn detection (Phase 2) |
-| Playwright | [playwright](https://playwright.dev/) | Video evidence for tests |
+| Pipecat | [pipecat-ai/pipecat](https://github.com/pipecat-ai/pipecat) | Concurrent pipeline (Phase 4) |
 
 ---
 

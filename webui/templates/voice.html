@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Intermediary Voice</title>
+    <link rel="stylesheet" href="/static/mvp.css">
+    <style>
+        .voice-btn {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            border: none;
+            background: #00b894;
+            color: #0e0e0f;
+            font-size: 24px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .voice-btn:hover { background: #00d4a6; transform: scale(1.05); }
+        .voice-btn.speaking { background: #e74c3c; animation: pulse 1s infinite; }
+        .voice-btn.listening { background: #f39c12; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(0, 184, 148, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(0, 184, 148, 0); }
+        }
+        .voice-mode {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            gap: 20px;
+        }
+        .voice-mode p { color: #8a8f98; font-size: 14px; max-width: 400px; text-align: center; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Intermediary Agent — Voice</h1>
+        <div class="header-right">
+            <div class="status-indicator">
+                <div id="status-dot" class="status-dot"></div>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="transcript-container">
+        <div id="transcript" class="transcript"></div>
+    </main>
+
+    <div class="composer">
+        <button id="voice-btn" class="voice-btn" title="Click to speak">🎙️</button>
+    </div>
+
+    <script type="module">
+        import { Room, RoomEvent } from 'https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js';
+
+        const transcript = document.getElementById('transcript');
+        const voiceBtn = document.getElementById('voice-btn');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+
+        let room = null;
+        let isSpeaking = false;
+        let isListening = false;
+
+        function setStatus(connected, text) {
+            statusDot.classList.toggle('connected', connected);
+            statusText.textContent = text;
+        }
+
+        function appendMsg(speaker, text) {
+            const msg = document.createElement('div');
+            msg.className = `message ${speaker}`;
+            const label = document.createElement('div');
+            label.className = 'speaker-label';
+            label.textContent = speaker.replace('_', ' ');
+            msg.appendChild(label);
+            const content = document.createElement('div');
+            content.className = 'content';
+            content.textContent = text;
+            msg.appendChild(content);
+            transcript.appendChild(msg);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        async function connect() {
+            try {
+                // Get token from your backend
+                const res = await fetch('/api/livekit/token');
+                const { token, url } = await res.json();
+
+                room = new Room({
+                    adaptiveStream: true,
+                    dynacast: true,
+                });
+
+                room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+                    if (track.kind === 'audio') {
+                        const el = track.attach();
+                        el.style.display = 'none';
+                        document.body.appendChild(el);
+                    }
+                });
+
+                await room.connect(url, token);
+                setStatus(true, 'Connected');
+                appendMsg('system', 'Connected to LiveKit room');
+            } catch (e) {
+                setStatus(false, 'Error');
+                appendMsg('system', `Connection error: ${e.message}`);
+            }
+        }
+
+        async function toggleMic() {
+            if (!room) {
+                await connect();
+            }
+
+            if (isSpeaking) {
+                room.localParticipant.setMicrophoneEnabled(false);
+                isSpeaking = false;
+                voiceBtn.classList.remove('speaking');
+            } else {
+                room.localParticipant.setMicrophoneEnabled(true);
+                isSpeaking = true;
+                voiceBtn.classList.add('speaking');
+            }
+        }
+
+        voiceBtn.addEventListener('click', toggleMic);
+
+        // Try to connect on load
+        appendMsg('system', 'Connecting to LiveKit...');
+        // connect();
+    </script>
+</body>
+</html>

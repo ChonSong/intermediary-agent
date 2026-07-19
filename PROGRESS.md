@@ -7,13 +7,13 @@
 | 1.1 | ✅ Done | Scaffold, HermesClient, mock server, 5 tests | — |
 | 1.4 | ✅ Done | Distillation buffer + 28 unit tests | — |
 | 1.6a | ✅ Done | Barge-in state machine + 10 integration tests | — |
-| 1.5+1.7 | ✅ Done | Text MVP — TextIntermediary, FastAPI SSE, frontend, 61 tests passing | Connect real Hermes with auth token |
+| 1.5 | ✅ Done | Text MVP — TextIntermediary, FastAPI SSE, frontend | Need auth token for real Hermes |
 | 1.6b | 📋 Ready | Live integration test file ready | Need Hermes WebUI auth token |
-| 1.8 | 📋 Planned | Telemetry + video E2E | — |
-| 2 | 📋 Planned | TEN Turn Detection | — |
-| 3 | 📋 Planned | Discord bridge | — |
-| 4 | 📋 Planned | WebUI extension + emotion-avatar | — |
+| 2 | 🚧 In Progress | VoiceIntermediaryAgent + LiveKit worker | LiveKit server confirmed working (Docker) |
+| 3 | 📋 Planned | Real Hermes integration (need auth token) | — |
+| 4 | 📋 Planned | Discord bridge | — |
+| 5 | 📋 Planned | WebUI extension | — |
 
-**MVP Status:** Working end-to-end with mock Hermes.
+**MVP Status:** Text MVP working end-to-end with mock Hermes. Voice agent scaffolding complete. LiveKit server confirmed working.
 
 Last update: 2026-07-19

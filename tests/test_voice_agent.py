@@ -26,7 +26,7 @@ def test_get_tools(agent):
     """Tools include query_hermes."""
     tools = agent._get_tools()
     assert len(tools) > 0
-    assert any(t.name == "query_hermes" for t in tools)
+    assert any(t.info.name == "query_hermes" for t in tools)
 
 
 @pytest.mark.skipif(

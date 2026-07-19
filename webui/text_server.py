@@ -41,13 +41,6 @@ USE_MOCK = os.environ.get("HERMES_MOCK", "true").lower() == "true"
 HERMES_PASSWORD = os.environ.get("HERMES_PASSWORD", "Cheong02")
 
 
-def get_hermes_client(cookie: Optional[str] = None) -> HermesClient:
-    """Get HermesClient (real or mock)."""
-    if USE_MOCK:
-        return _create_mock_client()
-    return HermesClient(HERMES_URL, cookie=cookie)
-
-
 def _create_mock_client() -> HermesClient:
     """Create a HermesClient backed by mock Hermes server."""
     mock_app = create_mock_hermes(
@@ -132,7 +125,7 @@ async def start_chat(request: Request):
         intermediary = TextIntermediary(hermes_client, session_id=session_id)
         refined = intermediary._refine(message)
         
-        # Start real Hermes chat with refined message (this returns immediately)
+        # Start real Hermes chat with refined message (this returns the stream_id)
         real_stream_id = await hermes_client.start_chat(refined, session_id)
         
         stream_id = f"chat-{uuid.uuid4().hex[:8]}"
@@ -155,7 +148,7 @@ async def chat_stream(stream_id: str):
 
     async def generate() -> AsyncIterable[str]:
         try:
-            # Pass the real_stream_id so intermediary doesn't start a new chat
+            # Pass real_stream_id so intermediary uses the already-started stream
             async for event in intermediary.chat(message, stream_id=real_stream_id):
                 data = event.to_dict()
                 yield f"data: {json.dumps(data)}\n\n"

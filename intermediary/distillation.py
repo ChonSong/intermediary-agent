@@ -62,18 +62,85 @@ def strip_markdown(text: str) -> str:
     return text
 
 
+def _is_reasoning(text: str) -> bool:
+    """Heuristic: detect if text is internal reasoning rather than a direct answer."""
+    text_lower = text.lower().strip()
+    if not text_lower:
+        return False
+    # Common reasoning prefixes from LongCat / Claude models
+    reasoning_prefixes = [
+        'the user is ',
+        'the user wants',
+        'they want to ',
+        'they\'re asking',
+        'this is a ',
+        'this question ',
+        'let me ',
+        'i should ',
+        'i\'ll ',
+        'i need to ',
+        'first, ',
+        'next, ',
+        'however, ',
+        'actually, ',
+        'looks like ',
+        'appears to be ',
+        'doesn\'t require ',
+        'doesn\'t need ',
+        'simple question',
+        'trivial question',
+        'straightforward ',
+        'i can answer',
+        'i\'ll answer',
+        'i should answer',
+        'no need for',
+        'the answer is straightforward',
+        'succinct response',
+        'keep it brief',
+        'i\'ll respond',
+        'i should respond',
+        'i can respond',
+        'i need to respond',
+        'it directly',
+        'promptly',
+        'correct answer to',
+        'i\'ve determined',
+        'based on the',
+        'given the context',
+    ]
+    for prefix in reasoning_prefixes:
+        if text_lower.startswith(prefix):
+            return True
+    # Also detect reasoning by shape: "The X is/are Y. This is/are Z. I should/need/ll..."
+    if re.search(r'\b(i|i\'ll|i\'m|let me|the user|this is)', text_lower):
+        if re.search('\b(should|need to|will|going to|must|have to)\b', text_lower):
+            return True
+    return False
+
+
 async def distill(raw_text: str) -> str:
     """
     Rewrite a raw Hermes response sentence for natural speech.
     
-    Phase 1: rule-based heuristic (strip markdown, keep first 1-2 sentences).
+    Phase 1: rule-based heuristic — filter reasoning, strip markdown.
     Phase 1.3+: uses LLM via LiveKit's LLM Output Replacement recipe.
     """
     text = strip_markdown(raw_text)
     # Strip tool use JSON (simplified)
     text = re.sub(r'\{[^}]*"tool"[^}]*\}', '', text)
-    # Keep first 1-2 sentences
+    
+    # Split into sentences
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    if len(sentences) > 2:
-        text = ' '.join(sentences[:2])
+    if not sentences:
+        return ''
+    
+    # Filter out reasoning sentences
+    answer_sentences = [s for s in sentences if not _is_reasoning(s)]
+    
+    # If all sentences were reasoning, return empty (no answer to speak)
+    if not answer_sentences:
+        return ''
+    
+    # Keep first 2 answer sentences
+    text = ' '.join(answer_sentences[:2])
     return text.strip()

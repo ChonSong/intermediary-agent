@@ -1,55 +1,37 @@
-"""Intermediary events — structured events for emotion-avatar extension point.
+"""Intermediary events — structured events for UI and future audio."""
 
-The intermediary emits these events so any renderer can subscribe:
-- LiveKit TTS: consumes text → audio
-- Transcript UI: consumes text → display
-- Emotion-avatar (future): consumes emotion+text → animation
-"""
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-from enum import Enum
 
 
-class Speaker(Enum):
+class Speaker:
     USER = "user"
-    HERMES = "hermes_raw"
     INTERMEDIARY = "intermediary"
+    HERMES = "hermes_raw"
     AGENT_SPEAKING = "agent_speaking"
     SYSTEM = "system"
 
 
-class Emotion(Enum):
-    """Emotion hints for future avatar renderer."""
+class Emotion:
     NEUTRAL = "neutral"
-    HAPPY = "happy"
-    SAD = "sad"
     THINKING = "thinking"
-    SURPRISED = "surprised"
+    HAPPY = "happy"
     CONFUSED = "confused"
 
 
 @dataclass
 class IntermediaryEvent:
-    """Structured event emitted by the intermediary agent.
-    
-    Can be consumed by:
-    - LiveKit TTS (text → audio frames)
-    - Transcript UI (text → DOM elements)
-    - Emotion-avatar (emotion + text → animation state)
-    """
-    speaker: Speaker
+    speaker: str
     text: str
     timestamp: float
-    emotion: Optional[Emotion] = None
-    audio: Optional[bytes] = None  # raw audio for lip-sync
-    generation: int = 0  # increments on barge-in
+    emotion: Optional[str] = None
+    audio: Optional[bytes] = None
+    generation: int = 0
     
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return {
-            "speaker": self.speaker.value,
+            "speaker": self.speaker,
             "text": self.text,
             "timestamp": self.timestamp,
-            "emotion": self.emotion.value if self.emotion else None,
-            "generation": self.generation,
+            "emotion": self.emotion,
         }

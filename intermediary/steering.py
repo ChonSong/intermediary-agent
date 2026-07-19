@@ -37,6 +37,9 @@ class BargeInStateMachine:
             self.generation += 1
             # CRITICAL: POST /api/chat/steer IMMEDIATELY
             self._steer_posted_at = time.perf_counter()
+        elif self.state == self.STALE:
+            # Multiple barge-ins: update pending steer
+            self.pending_steer = text
         elif self.state == self.LISTENING:
             # Normal turn
             self.state = self.SPEAKING

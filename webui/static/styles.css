@@ -1,0 +1,131 @@
+/* Transcript UI styles */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0e0e0f;
+    color: #d7d7d7;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid #2a2e32;
+    background: #1a1c1e;
+}
+
+header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #00b894;
+}
+
+.status {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: #2a2e32;
+    color: #8a8f98;
+}
+
+.status.connected {
+    background: #00b89420;
+    color: #00b894;
+}
+
+.status.disconnected {
+    background: #e74c3c20;
+    color: #e74c3c;
+}
+
+main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+}
+
+.transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.message {
+    padding: 10px 14px;
+    border-radius: 10px;
+    max-width: 85%;
+    line-height: 1.5;
+    font-size: 14px;
+    animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.message.user {
+    background: #1e3a5f;
+    color: #74b9ff;
+    align-self: flex-end;
+    border-bottom-right-radius: 2px;
+}
+
+.message.hermes_raw {
+    background: #1a1c1e;
+    color: #8a8f98;
+    align-self: flex-start;
+    border-bottom-left-radius: 2px;
+    font-family: 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 13px;
+}
+
+.message.intermediary {
+    background: #1e3a2e;
+    color: #00b894;
+    align-self: flex-start;
+    border-bottom-left-radius: 2px;
+}
+
+.message.agent_speaking {
+    background: #1e3a2e;
+    color: #00b894;
+    align-self: flex-start;
+    border-bottom-left-radius: 2px;
+    font-style: italic;
+}
+
+.message.system {
+    background: #2a2e32;
+    color: #8a8f98;
+    align-self: center;
+    font-size: 12px;
+    font-style: italic;
+}
+
+.message .speaker {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-bottom: 2px;
+}
+
+.message .timestamp {
+    font-size: 10px;
+    opacity: 0.4;
+    margin-top: 4px;
+    text-align: right;
+}

@@ -1,66 +1,68 @@
 # Intermediary Agent
 
-> A LiveKit-based voice intermediary that sits between you and Hermes. Refines messy input, distills verbose output, handles barge-in steering. All through a single system prompt — no separate modules.
+> A self-hosted voice intermediary between you and Hermes. Refines messy input, distills verbose output, handles barge-in steering. Zero third-party API dependencies — runs entirely on your machine.
 
 ---
 
 ## Architecture
 
 ```
-User ↔ LiveKit (WebRTC + STT/TTS/VAD) ↔ VoicePipelineAgent (intermediary LLM) ↔ Hermes API
+Browser (mic/speakers) ⟷ WebSocket ⟷ Voice Server (Python) ⟷ Hermes API
+     getUserMedia()          PCM frames        STT → LLM → TTS
+     WebRTC AEC                              (all local)
 ```
 
-LiveKit handles audio. The intermediary LLM handles meaning. Hermes handles reasoning.
+**All components run locally:**
+- **STT**: faster-whisper (speech → text)
+- **LLM**: Ollama qwen2.5:7b (intermediary: refine + distill + steer)
+- **TTS**: Kokoro-82m (text → audio)
+- **VAD**: silero-vad (speech/silence detection)
+- **Hermes**: Your existing API (reasoning)
 
-**The intermediary is a thin LLM with one system prompt**, not three Python modules:
+**No LiveKit. No Deepgram. No Cartesia. No OpenAI. No API keys.**
 
-1. **Refine**: "um the docker thing?" → "Debug the Docker socket permission error"
-2. **Distill**: 3 paragraphs → 1-2 sentences for natural speech
-3. **Steer**: inject user corrections mid-turn via existing `/api/chat/steer`
+## Quick Start
 
-## Quick Start (Development)
-
-### Phase 1: Text MVP (Done)
+### Prerequisites
 
 ```bash
-cd /home/sc/intermediary-agent
-pip install -e .
+# Install Ollama (https://ollama.com)
+ollama pull qwen2.5:7b
 
-# Terminal 1: Start text server (uses mock Hermes by default)
+# Install Kokoro TTS (https://github.com/hexgrad/kokoro)
+pip install kokoro
+
+# Install faster-whisper
+pip install faster-whisper
+
+# Install other deps
+pip install -e ".[voice]"
+```
+
+### Run
+
+```bash
+# Terminal 1: Start voice server
+cd /home/sc/intermediary-agent
+python -m intermediary.voice.server
+
+# Terminal 2: Start text server (optional, for text-only mode)
 python -m uvicorn webui.text_server:app --host 0.0.0.0 --port 8080
 
 # Browser: Open http://localhost:8080
-```
-
-### Phase 2: LiveKit Voice (Next)
-
-```bash
-# Install LiveKit Go binary (see https://docs.livekit.io/getting-started/installing/)
-livekit-server --dev &
-
-# Start voice agent
-python -m intermediary.voice_agent
-```
-
-### Phase 3: Real Hermes
-
-```bash
-export HERMES_MOCK=false
-export HERMES_URL=http://127.0.0.1:9119
-export HERMES_AUTH_TOKEN=***  # Get from your Hermes dashboard
-python -m intermediary.voice_agent
+# Click mic button → speak → hear response
 ```
 
 ## Current Status
 
-| Phase | Status | Tests |
-|-------|--------|-------|
-| 0 | ✅ Docs, plan, skills loaded | — |
-| 1 | ✅ Text MVP (mock Hermes) | 61 passing |
-| 2 | 📋 LiveKit voice pipeline | — |
-| 3 | 📋 Real Hermes (blocked by auth) | — |
-| 4 | 📋 Discord bridge | — |
-| 5 | 📋 WebUI extension | — |
+| Phase | What | Status | Tests |
+|-------|------|--------|-------|
+| 0 | Docs, plan, skills loaded | ✅ Done | — |
+| 1 | Text MVP (mock Hermes) | ✅ Done | 63 passing |
+| 2 | Voice pipeline (local models) | 📋 Planned | — |
+| 3 | Real Hermes integration | 📋 Planned | — |
+| 4 | Discord bridge | 📋 Planned | — |
+| 5 | WebUI extension | 📋 Planned | — |
 
 ## Documentation
 
@@ -68,29 +70,38 @@ python -m intermediary.voice_agent
 |------|---------|
 | `README.md` | This file — overview, quick start |
 | `PLAN.md` | Full implementation plan (architecture, components, integration) |
+| `PLAN_PATH_C.md` | DeepThink analysis of self-hosted voice path |
 | `ROADMAP.md` | Phases, milestones, external dependencies |
-| `INTEGRATION.md` | Hermes API endpoints, LiveKit events, config reference |
+| `INTEGRATION.md` | Hermes API endpoints, config reference |
 | `PROGRESS.md` | Session-by-session status |
 
 ## Key Decisions
 
-### Why LiveKit (not TEN/Pipecat)?
+### Why Self-Hosted (No LiveKit)?
 
-LiveKit handles all audio plumbing (STT, TTS, VAD, barge-in, echo cancellation). TEN provides better turn-taking for group conversations — unnecessary for single-user agent. Can be reconsidered if VAD feels off.
+LiveKit requires commercial providers (Deepgram/OpenAI/Cartesia) for speech. Local models give same quality, full privacy, zero ongoing cost, and one less dependency to manage.
 
-### Why not replace the intermediary with LiveKit?
+### Why Not Web Speech API?
 
-LiveKit's `VoicePipelineAgent` chains `STT → LLM → TTS`. The LLM **is** the intermediary. We still need refine/distill/steer behaviors — just encoded in the system prompt, not separate modules.
+Web Speech API TTS is clearly robotic (user rejected it). It also sends audio to Google — not private despite being "browser-native." Local Kokoro TTS is higher quality and fully private.
 
 ### Hermes as Separate API
 
-Hermes is an autonomous multi-agent system with memory, toolsets, and context compression. Forcing it into a single function call strips its autonomy. LiveKit = sensory interface (ears + mouth). Hermes = brain.
+Hermes is an autonomous multi-agent system with memory, toolsets, and context compression. The intermediary is a thin LLM that handles voice I/O and meaning — Hermes handles reasoning.
 
 ### No Separate Modules
 
 Refine/distill/steer are one system prompt, not `refine.py`/`distill.py`/`steer.py`. The DistillationBuffer handles 1-4 char SSE deltas → sentence boundaries. That's it.
 
----
+## Hardware Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| RAM | 8GB | 16GB |
+| Disk | 5GB | 10GB |
+| GPU | Optional (CPU works) | NVIDIA for real-time |
+
+All components work on CPU. GPU makes STT/TTS real-time (<500ms).
 
 ## License
 

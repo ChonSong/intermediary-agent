@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Intermediary Agent — MVP</title>
+    <link rel="stylesheet" href="/static/mvp.css">
+</head>
+<body>
+    <header>
+        <h1>Intermediary Agent</h1>
+        <div class="header-right">
+            <div class="status-indicator">
+                <div id="status-dot" class="status-dot"></div>
+                <span id="status-text">Disconnected</span>
+            </div>
+            <button id="demo-btn" class="demo-btn" title="Fill with sample text">Demo</button>
+        </div>
+    </header>
+
+    <main class="transcript-container">
+        <div id="transcript" class="transcript"></div>
+    </main>
+
+    <div class="composer">
+        <div class="composer-inner">
+            <textarea 
+                id="composer-input" 
+                placeholder="Type your message... (Enter to send, Shift+Enter for newline)"
+                rows="1"
+                autocomplete="off"
+                spellcheck="false"
+            ></textarea>
+            <button id="send-btn" type="button">Send</button>
+        </div>
+    </div>
+
+    <script src="/static/mvp.js"></script>
+</body>
+</html>

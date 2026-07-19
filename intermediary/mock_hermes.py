@@ -1,9 +1,10 @@
 """
 Mock Hermes server for testing.
 
-Mimics the exact Hermes WebUI API:
+Mimics the EXACT real Hermes WebUI API format:
+- POST /api/session/new → {session: {session_id, title, workspace}}
 - POST /api/chat/start → {stream_id}
-- GET /api/chat/stream?stream_id=... → SSE stream
+- GET /api/chat/stream?stream_id=... → SSE stream with 'event: reasoning' lines
 - POST /api/chat/steer → {accepted: bool}
 """
 
@@ -32,26 +33,28 @@ def create_mock_hermes(
     """
     app = FastAPI()
     
-    # In-memory store for active streams
     active_streams: dict[str, dict] = {}
+    active_sessions: dict[str, dict] = {}
     
-    @app.post("/api/sessions")
+    @app.post("/api/session/new")
     async def create_session():
-        return {"session_id": f"ses-{uuid.uuid4().hex[:8]}"}
+        session_id = f"ses-{uuid.uuid4().hex[:8]}"
+        active_sessions[session_id] = {"session_id": session_id}
+        return {"session": {"session_id": session_id, "title": "Untitled", "workspace": "/home/sc/workspace"}}
     
     @app.post("/api/chat/start")
     async def chat_start(body: dict):
         session_id = body.get("session_id", "")
         message = body.get("message", "")
+        if session_id not in active_sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
         stream_id = f"stream-{uuid.uuid4().hex[:8]}"
-        
         active_streams[stream_id] = {
             "session_id": session_id,
             "message": message,
             "steered": False,
             "steer_text": None,
         }
-        
         return {"stream_id": stream_id}
     
     @app.get("/api/chat/stream")
@@ -62,19 +65,23 @@ def create_mock_hermes(
         stream_info = active_streams[stream_id]
         
         async def generate():
-            # Use the response text (modified if steered)
             text = response_text
             if stream_info["steered"] and stream_info["steer_text"]:
-                # After steer, generate a new response
                 text = f"Ah, you meant {stream_info['steer_text']}. Let me check that instead."
             
-            # Stream as SSE deltas
+            # Real Hermes SSE format: "id: stream_id:N\nevent: reasoning\ndata: {"text": "..."}"
+            n = 0
             for i in range(0, len(text), chunk_size):
                 chunk = text[i:i + chunk_size]
-                yield f"data: {{\"type\": \"delta\", \"content\": {json.dumps(chunk)}}}\n\n"
+                n += 1
+                yield f"id: {stream_id}:{n}\n"
+                yield f"event: reasoning\ndata: {json.dumps({'text': chunk})}\n\n"
                 await asyncio.sleep(chunk_delay)
             
-            yield f"data: {{\"type\": \"done\"}}\n\n"
+            # Done event
+            n += 1
+            yield f"id: {stream_id}:{n}\n"
+            yield f"event: done\ndata: {{}}\n\n"
         
         return StreamingResponse(
             generate(),
@@ -86,7 +93,6 @@ def create_mock_hermes(
         session_id = body.get("session_id", "")
         text = body.get("text", "")
         
-        # Find the active stream for this session
         for stream_id, info in active_streams.items():
             if info["session_id"] == session_id:
                 info["steered"] = True

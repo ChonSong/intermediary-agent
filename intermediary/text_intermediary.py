@@ -27,7 +27,7 @@ class TextIntermediary:
     Text-only intermediary — no LiveKit, no voice.
     
     Usage:
-        intermediary = TextIntermediary(hermes_client)
+        intermediary = TextIntermediary(hermes_client, session_id="ses-123")
         async for event in intermediary.chat("um the docker thing?"):
             print(event.speaker, event.text)
     """
@@ -41,10 +41,14 @@ class TextIntermediary:
         self.session_id = session_id
         self._barge_in_sm = BargeInStateMachine()
     
-    async def chat(self, message: str) -> AsyncIterable[IntermediaryEvent]:
+    async def chat(self, message: str, stream_id: Optional[str] = None) -> AsyncIterable[IntermediaryEvent]:
         """
         Process a user message through the full pipeline.
         
+        Args:
+            message: Raw user input
+            stream_id: If provided, use this stream_id instead of starting a new chat
+            
         Yields:
         - refined: the clarified user input
         - hermes_raw: the full Hermes response (accumulated)
@@ -52,6 +56,13 @@ class TextIntermediary:
         - done: when Hermes finishes
         """
         timestamp = time.time()
+        
+        # Auto-create session if using default
+        if self.session_id == "default":
+            try:
+                self.session_id = await self.hermes.create_session()
+            except Exception:
+                pass  # Mock might not have create_session
         
         # 1. Refine
         refined = self._refine(message)
@@ -62,8 +73,9 @@ class TextIntermediary:
             emotion=Emotion.THINKING,
         )
         
-        # 2. Start Hermes run
-        stream_id = await self.hermes.start_chat(refined, self.session_id)
+        # 2. Start Hermes run (or use provided stream_id)
+        if stream_id is None:
+            stream_id = await self.hermes.start_chat(refined, self.session_id)
         
         # 3. Stream Hermes response → buffer → distill
         buffer = DistillationBuffer()
@@ -130,5 +142,9 @@ class TextIntermediary:
     def _refine(self, text: str) -> str:
         """Refine messy input. Phase 1: placeholder. Phase 1.3+: LLM call."""
         import re
-        refined = re.sub(r'^(um+|so+|like+|you know+)\s*', '', text, flags=re.IGNORECASE)
+        # Remove consecutive filler words from the start (greedy)
+        pattern = re.compile(r'^(?:(?:um+|so+|like+|you know+)\s*)+', flags=re.IGNORECASE)
+        refined = pattern.sub('', text)
+        # Remove leading comma if present
+        refined = re.sub(r'^,\s*', '', refined)
         return refined.strip() or text.strip()

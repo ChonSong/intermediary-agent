@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import uuid
-from typing import AsyncIterable
+from typing import AsyncIterable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -36,15 +36,16 @@ app.mount("/static", StaticFiles(directory="webui/static"), name="static")
 # In-memory store for active intermediaries
 active_chats: dict[str, tuple[TextIntermediary, str]] = {}
 
-HERMES_URL = os.environ.get("HERMES_URL", "http://127.0.0.1:9119")
+HERMES_URL = os.environ.get("HERMES_URL", "http://127.0.0.1:8788")
 USE_MOCK = os.environ.get("HERMES_MOCK", "true").lower() == "true"
+HERMES_PASSWORD = os.environ.get("HERMES_PASSWORD", "Cheong02")
 
 
-def get_hermes_client() -> HermesClient:
+def get_hermes_client(cookie: Optional[str] = None) -> HermesClient:
     """Get HermesClient (real or mock)."""
     if USE_MOCK:
         return _create_mock_client()
-    return HermesClient(HERMES_URL)
+    return HermesClient(HERMES_URL, cookie=cookie)
 
 
 def _create_mock_client() -> HermesClient:
@@ -73,6 +74,35 @@ async def health():
     return {"ok": True, "mock": USE_MOCK}
 
 
+@app.post("/api/session")
+async def create_session(request: Request):
+    """Create a real Hermes session. Returns session_id and cookie."""
+    if USE_MOCK:
+        return {"session_id": "mock-session", "cookie": ""}
+    
+    async with httpx.AsyncClient() as client:
+        # Login
+        login_resp = await client.post(
+            f"{HERMES_URL}/api/auth/login",
+            json={"password": HERMES_PASSWORD},
+        )
+        login_resp.raise_for_status()
+        cookie = login_resp.cookies.get("hermes_session", "")
+        
+        # Create session
+        resp = await client.post(
+            f"{HERMES_URL}/api/session/new",
+            cookies={"hermes_session": cookie},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        return {
+            "session_id": data["session"]["session_id"],
+            "cookie": cookie,
+        }
+
+
 @app.post("/api/chat")
 async def start_chat(request: Request):
     """Start a new chat. Returns stream_id for SSE streaming."""
@@ -81,16 +111,40 @@ async def start_chat(request: Request):
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
-    hermes_client = get_hermes_client()
-    intermediary = TextIntermediary(hermes_client)
-
-    stream_id = f"chat-{uuid.uuid4().hex[:8]}"
-    active_chats[stream_id] = (intermediary, message)
-
-    return {
-        "stream_id": stream_id,
-        "refined": intermediary._refine(message),
-    }
+    if USE_MOCK:
+        hermes_client = _create_mock_client()
+        intermediary = TextIntermediary(hermes_client)
+        stream_id = f"chat-{uuid.uuid4().hex[:8]}"
+        active_chats[stream_id] = (intermediary, message)
+        return {
+            "stream_id": stream_id,
+            "refined": intermediary._refine(message),
+        }
+    else:
+        # Real Hermes with session + cookie
+        session_id = body.get("session_id")
+        cookie = body.get("cookie")
+        
+        if not session_id or not cookie:
+            return {"error": "session_id and cookie required. Call /api/session first."}
+        
+        hermes_client = HermesClient(HERMES_URL, cookie=cookie)
+        
+        # Start the chat (refine first, then start with refined text)
+        intermediary = TextIntermediary(hermes_client, session_id=session_id)
+        refined = intermediary._refine(message)
+        
+        # Start real Hermes chat with refined message
+        real_stream_id = await hermes_client.start_chat(refined, session_id)
+        
+        stream_id = f"chat-{uuid.uuid4().hex[:8]}"
+        active_chats[stream_id] = (intermediary, message)
+        
+        return {
+            "stream_id": stream_id,
+            "real_stream_id": real_stream_id,
+            "refined": refined,
+        }
 
 
 @app.get("/api/chat/stream")

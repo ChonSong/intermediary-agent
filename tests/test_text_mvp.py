@@ -332,7 +332,8 @@ async def test_full_pipeline_integration():
         chunk_delay=0.001,
     )
     client = HermesClient("http://test", _transport=httpx.ASGITransport(app))
-    intermediary = TextIntermediary(client, session_id="test-session")
+    session_id = await client.create_session()
+    intermediary = TextIntermediary(client, session_id=session_id)
 
     # Run the full pipeline (single filler word — refinement only removes one prefix)
     events = []

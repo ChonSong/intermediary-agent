@@ -8,7 +8,7 @@
 | 1.4 | ✅ Done | Distillation buffer + 28 unit tests | — |
 | 1.6a | ✅ Done | Barge-in state machine + 10 integration tests | — |
 | 1.5 | ✅ Done | Text MVP — TextIntermediary, FastAPI SSE, frontend | Need auth token for real Hermes |
-| 1.6b | 📋 Ready | Live integration test file ready | Need Hermes WebUI auth token |
+| 1.6b | ✅ Done | Real Hermes API wired (cookie auth, session, streaming) | — |
 | 2 | 🚧 In Progress | VoiceIntermediaryAgent + LiveKit worker | LiveKit server confirmed working (Docker) |
 | 3 | 📋 Planned | Real Hermes integration (need auth token) | — |
 | 4 | 📋 Planned | Discord bridge | — |

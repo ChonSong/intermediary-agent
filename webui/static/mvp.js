@@ -2,10 +2,12 @@
  * MVP Text Chat — Intermediary Agent frontend
  * 
  * Flow:
- * 1. User types message → POST /api/chat → receive stream_id
- * 2. Connect to SSE: GET /api/chat/stream?stream_id=XXX
- * 3. Render events as they arrive (user → refined → hermes_raw → distilled)
- * 4. Handle reconnection and demo mode
+ * 1. On load, check if real Hermes is available
+ * 2. If real Hermes: POST /api/session → get session_id + cookie
+ * 3. User types message → POST /api/chat with session_id + cookie → receive stream_id
+ * 4. Connect to SSE: GET /api/chat/stream?stream_id=XXX
+ * 5. Render events as they arrive (user → refined → hermes_raw → distilled)
+ * 6. Handle reconnection and demo mode
  */
 
 (function() {
@@ -25,6 +27,11 @@
     let isProcessing = false;
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
+    
+    // Session state (for real Hermes)
+    let sessionId = null;
+    let authCookie = null;
+    let useRealHermes = false;
 
     // --- Status management ---
 
@@ -159,19 +166,20 @@
                 setStatus(false, 'Connection error');
             }
 
-            // Auto-reconnect logic
+            // Auto-reconnect logic (only on transient errors, not normal close)
             eventSource.close();
             eventSource = null;
 
-            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && currentStreamId) {
+            // SSE onerror fires on normal close too — only reconnect if we didn't get "done"
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && currentStreamId && isProcessing) {
                 reconnectAttempts++;
-                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 3000);
                 setStatus(false, `Reconnecting (${reconnectAttempts})...`);
                 setTimeout(() => {
-                    if (currentStreamId) connectSSE(currentStreamId);
+                    if (currentStreamId && isProcessing) connectSSE(currentStreamId);
                 }, delay);
             } else {
-                setStatus(false, 'Disconnected');
+                setStatus(false, 'Ready');
                 isProcessing = false;
                 updateUI();
             }
@@ -212,6 +220,29 @@
         appendMessage(speaker, text, timestamp);
     }
 
+    // --- Initialize session (for real Hermes) ---
+
+    async function initSession() {
+        try {
+            const resp = await fetch('/api/session', { method: 'POST' });
+            if (resp.ok) {
+                const data = await resp.json();
+                sessionId = data.session_id;
+                authCookie = data.cookie;
+                useRealHermes = true;
+                setStatus(false, 'Ready (Real Hermes)');
+                console.log('Real Hermes session:', sessionId);
+            } else {
+                // Fall back to mock
+                useRealHermes = false;
+                setStatus(false, 'Ready (Mock)');
+            }
+        } catch (e) {
+            useRealHermes = false;
+            setStatus(false, 'Ready (Mock)');
+        }
+    }
+
     // --- Send message ---
 
     async function sendMessage() {
@@ -227,10 +258,18 @@
         autoResize();
 
         try {
+            const body = { message: text };
+            
+            // Include session_id and cookie for real Hermes
+            if (useRealHermes && sessionId && authCookie) {
+                body.session_id = sessionId;
+                body.cookie = authCookie;
+            }
+            
             const response = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: text })
+                body: JSON.stringify(body)
             });
 
             if (!response.ok) {
@@ -238,6 +277,12 @@
             }
 
             const data = await response.json();
+            
+            // Handle error response
+            if (data.error) {
+                throw new Error(data.error);
+            }
+            
             const streamId = data.stream_id;
 
             if (!streamId) {
@@ -304,12 +349,23 @@
     // --- Initialize ---
 
     function init() {
-        setStatus(false, 'Ready');
+        setStatus(false, 'Connecting...');
         updateUI();
         inputEl.focus();
 
         // Add welcome message
-        appendMessage('system', 'Welcome! Type a message to chat with the Intermediary Agent.', new Date().toISOString());
+        appendMessage('system', 'Welcome! Initializing...', new Date().toISOString());
+
+        // Initialize session (tries real Hermes, falls back to mock)
+        initSession().then(() => {
+            // Replace welcome message
+            const firstMsg = transcriptEl.querySelector('.message.system');
+            if (firstMsg) firstMsg.remove();
+            appendMessage('system', useRealHermes 
+                ? 'Connected to Real Hermes. Type a message to begin.' 
+                : 'Running in demo mode (mock Hermes). Type a message to begin.', 
+                new Date().toISOString());
+        });
     }
 
     init();

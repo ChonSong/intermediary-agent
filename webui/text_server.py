@@ -33,8 +33,8 @@ app.add_middleware(
 # Mount static files
 app.mount("/static", StaticFiles(directory="webui/static"), name="static")
 
-# In-memory store for active intermediaries
-active_chats: dict[str, tuple[TextIntermediary, str]] = {}
+# In-memory store: stream_id -> (intermediary, message, real_stream_id)
+active_chats: dict[str, tuple] = {}
 
 HERMES_URL = os.environ.get("HERMES_URL", "http://127.0.0.1:8788")
 USE_MOCK = os.environ.get("HERMES_MOCK", "true").lower() == "true"
@@ -81,7 +81,6 @@ async def create_session(request: Request):
         return {"session_id": "mock-session", "cookie": ""}
     
     async with httpx.AsyncClient() as client:
-        # Login
         login_resp = await client.post(
             f"{HERMES_URL}/api/auth/login",
             json={"password": HERMES_PASSWORD},
@@ -89,7 +88,6 @@ async def create_session(request: Request):
         login_resp.raise_for_status()
         cookie = login_resp.cookies.get("hermes_session", "")
         
-        # Create session
         resp = await client.post(
             f"{HERMES_URL}/api/session/new",
             cookies={"hermes_session": cookie},
@@ -115,7 +113,7 @@ async def start_chat(request: Request):
         hermes_client = _create_mock_client()
         intermediary = TextIntermediary(hermes_client)
         stream_id = f"chat-{uuid.uuid4().hex[:8]}"
-        active_chats[stream_id] = (intermediary, message)
+        active_chats[stream_id] = (intermediary, message, None)
         return {
             "stream_id": stream_id,
             "refined": intermediary._refine(message),
@@ -130,15 +128,15 @@ async def start_chat(request: Request):
         
         hermes_client = HermesClient(HERMES_URL, cookie=cookie)
         
-        # Start the chat (refine first, then start with refined text)
+        # Create intermediary with the real session
         intermediary = TextIntermediary(hermes_client, session_id=session_id)
         refined = intermediary._refine(message)
         
-        # Start real Hermes chat with refined message
+        # Start real Hermes chat with refined message (this returns immediately)
         real_stream_id = await hermes_client.start_chat(refined, session_id)
         
         stream_id = f"chat-{uuid.uuid4().hex[:8]}"
-        active_chats[stream_id] = (intermediary, message)
+        active_chats[stream_id] = (intermediary, message, real_stream_id)
         
         return {
             "stream_id": stream_id,
@@ -153,11 +151,12 @@ async def chat_stream(stream_id: str):
     if stream_id not in active_chats:
         raise HTTPException(status_code=404, detail="stream not found")
 
-    intermediary, message = active_chats[stream_id]
+    intermediary, message, real_stream_id = active_chats[stream_id]
 
     async def generate() -> AsyncIterable[str]:
         try:
-            async for event in intermediary.chat(message):
+            # Pass the real_stream_id so intermediary doesn't start a new chat
+            async for event in intermediary.chat(message, stream_id=real_stream_id):
                 data = event.to_dict()
                 yield f"data: {json.dumps(data)}\n\n"
                 await asyncio.sleep(0.01)
@@ -193,7 +192,7 @@ async def steer(request: Request):
     if not stream_id or stream_id not in active_chats:
         raise HTTPException(status_code=404, detail="stream not found")
 
-    intermediary, _ = active_chats[stream_id]
+    intermediary, _, _ = active_chats[stream_id]
     result = await intermediary.steer(text)
     return result
 

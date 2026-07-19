@@ -48,7 +48,7 @@ class DistillationBuffer:
         if len(stripped) > 150:
             return True
         # Newline boundary (paragraph breaks)
-        if '\n' in stripped:
+        if '\n' in text:
             return True
         return False
 

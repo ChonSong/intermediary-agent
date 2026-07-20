@@ -42,10 +42,9 @@ class DistillationBuffer:
 def _is_reasoning(sentence: str) -> bool:
     """Detect if a sentence is internal reasoning, not a direct answer."""
     s = sentence.lower().strip()
-    if len(s) < 5:
+    if len(s) < 3:
         return False
     
-    # Strong reasoning indicators
     reasoning_patterns = [
         r'^the user (is|wants|asked|just|said|typed)',
         r'^this is (a |an |the )',
@@ -104,6 +103,11 @@ def _is_reasoning(sentence: str) -> bool:
         r'^i should (just|also|be|have|make|take|give|try|check|verify|confirm|consider|think|look|review|recheck|double-check|ensure)',
         r'^i\'ll (just|also|be|have|make|take|give|try|check|verify|confirm|consider|think|look|review|recheck|double-check|ensure)',
         r'^i (can|could|might|may|must|need to|want to|have to|should|will) (just|also|be|have|make|take|give|try|check|verify|confirm|consider|think|look|review|recheck|double-check|ensure)',
+        r'^provider config',
+        r'^- ',
+        r'^pool:',
+        r'^skill-',
+        r'^cred',
     ]
     
     for pattern in reasoning_patterns:
@@ -118,17 +122,32 @@ def _is_reasoning(sentence: str) -> bool:
     return False
 
 
+def _strip_answer_prefix(text: str) -> str:
+    """Strip reasoning-like prefixes from the start of an answer."""
+    s = text.strip()
+    # "From the context:" 
+    s = re.sub(r'^from the context:\s*', '', s, flags=re.IGNORECASE)
+    # "I'm running on X" → keep, this is the answer
+    # "The answer is X" → strip prefix
+    s = re.sub(r'^the answer is\s*', '', s, flags=re.IGNORECASE)
+    # "I think X" → strip prefix
+    s = re.sub(r'^i think\s+', '', s, flags=re.IGNORECASE)
+    # "Let me tell you:" 
+    s = re.sub(r'^let me tell you:\s*', '', s, flags=re.IGNORECASE)
+    # Strip leading quotes
+    s = re.sub(r'^["\']+', '', s)
+    return s.strip()
+
+
 def distill(raw_text: str) -> str:
     """
     Extract the answer from a Hermes response.
     
-    Strategy: 
+    Strategy:
     1. Split into sentences
-    2. Mark each sentence as reasoning or answer
-    3. Find the LAST CONTIGUOUS BLOCK of answer sentences
-    4. If the block is very short (e.g., "4"), extend one sentence back to capture context
-    
-    The actual answer is almost always at the end, after all the reasoning.
+    2. Filter out reasoning + metadata sentences
+    3. Take the LAST non-reasoning sentence (the direct answer)
+    4. Strip reasoning prefixes
     """
     text = raw_text.strip()
     if not text:
@@ -136,7 +155,6 @@ def distill(raw_text: str) -> str:
     
     # Split into sentences (handle newlines too)
     raw_sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
-    # Further split on period followed by capital letter
     sentences = []
     for s_in in raw_sentences:
         for s in re.split(r'(?<=[.])(?=[A-Z])', s_in):
@@ -150,24 +168,30 @@ def distill(raw_text: str) -> str:
     # Classify each sentence
     classified = [(s, _is_reasoning(s)) for s in sentences]
     
-    # Find the last contiguous block of non-reasoning sentences
-    last_block = []
-    for s, is_reversed in reversed(classified):
-        if is_reversed:
-            break
-        last_block.insert(0, s)
+    # Find ALL non-reasoning sentences with their indices
+    answer_sentences = [(i, s) for i, (s, is_rev) in enumerate(classified) if not is_rev]
     
-    # If everything was reasoning, take the shortest (usually a trailing answer)
-    if not last_block:
+    if not answer_sentences:
+        # All reasoning - return the shortest sentence
         shortest = min(sentences, key=len)
-        return shortest.strip()
+        return _strip_answer_prefix(shortest.strip())
     
-    # If last block is very short and there's more content, it might be an isolated answer
-    # like "4" — capture just that
-    result = " ".join(last_block)
+    # Take the LAST 1-2 non-reasoning sentences
+    # The answer is almost always at the end
+    last_idx, last_s = answer_sentences[-1]
+    
+    # If the second-to-last is also close and short, include it
+    result = last_s
+    if len(answer_sentences) >= 2:
+        prev_idx, prev_s = answer_sentences[-2]
+        if last_idx - prev_idx <= 2 and len(prev_s) < 60:
+            result = prev_s + " " + last_s
     
     # Strip markdown
     result = re.sub(r'\*\*([^*]+)\*\*', r'\1', result)
     result = re.sub(r'\*([^*]+)\*', r'\1', result)
+    
+    # Strip reasoning prefixes
+    result = _strip_answer_prefix(result)
     
     return result.strip()

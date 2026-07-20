@@ -49,8 +49,7 @@
         const label = document.createElement('div');
         label.className = 'speaker-label';
         let labelText = getSpeakerLabel(speaker);
-        if (isReasoning) labelText += ' reasoning';
-        if (isAnswer) labelText += ' answer';
+        // Don't append type to label — the pill shows that
         label.textContent = labelText;
         msg.appendChild(label);
 

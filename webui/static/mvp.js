@@ -1,19 +1,10 @@
 /**
  * MVP Text Chat — Intermediary Agent frontend
- * 
- * Flow:
- * 1. On load, check if real Hermes is available
- * 2. If real Hermes: POST /api/session → get session_id + cookie
- * 3. User types message → POST /api/chat with session_id + cookie → receive stream_id
- * 4. Connect to SSE: GET /api/chat/stream?stream_id=XXX
- * 5. Render events as they arrive (user → refined → hermes_raw → distilled)
- * 6. Handle reconnection and demo mode
  */
 
 (function() {
     'use strict';
 
-    // DOM elements
     const transcriptEl = document.getElementById('transcript');
     const inputEl = document.getElementById('composer-input');
     const sendBtn = document.getElementById('send-btn');
@@ -21,19 +12,15 @@
     const statusText = document.getElementById('status-text');
     const demoBtn = document.getElementById('demo-btn');
 
-    // State
     let eventSource = null;
     let currentStreamId = null;
     let isProcessing = false;
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
     
-    // Session state (for real Hermes)
     let sessionId = null;
     let authCookie = null;
     let useRealHermes = false;
-
-    // --- Status management ---
 
     function setStatus(connected, text) {
         if (connected) {
@@ -41,20 +28,30 @@
             statusText.textContent = text || 'Connected';
         } else {
             statusDot.classList.remove('connected');
-            statusText.textContent = text || 'Disconnected';
+            statusText.textContent = text || 'Connected';
         }
     }
 
-    // --- Message rendering ---
+    function createMessageElement(data) {
+        const speaker = data.speaker;
+        const text = data.text;
+        const timestamp = data.timestamp;
+        const isReasoning = data.is_reasoning;
+        const isAnswer = data.is_answer;
 
-    function createMessageElement(speaker, text, timestamp) {
         const msg = document.createElement('div');
         msg.className = `message ${speaker}`;
+        
+        if (isReasoning) msg.classList.add('reasoning');
+        if (isAnswer) msg.classList.add('answer');
 
         // Speaker label
         const label = document.createElement('div');
         label.className = 'speaker-label';
-        label.textContent = getSpeakerLabel(speaker);
+        let labelText = getSpeakerLabel(speaker);
+        if (isReasoning) labelText += ' reasoning';
+        if (isAnswer) labelText += ' answer';
+        label.textContent = labelText;
         msg.appendChild(label);
 
         // Content
@@ -64,10 +61,18 @@
         msg.appendChild(content);
 
         // Timestamp
-        const time = document.createElement('div');
-        time.className = 'timestamp';
-        time.textContent = formatTimestamp(timestamp);
-        msg.appendChild(time);
+        const timeEl = document.createElement('div');
+        timeEl.className = 'timestamp';
+        timeEl.textContent = formatTimestamp(timestamp);
+        msg.appendChild(timeEl);
+
+        // Type indicator pill
+        if (isReasoning || isAnswer) {
+            const pill = document.createElement('div');
+            pill.className = 'pill';
+            pill.textContent = isReasoning ? 'reasoning' : 'answer';
+            msg.appendChild(pill);
+        }
 
         return msg;
     }
@@ -75,11 +80,10 @@
     function getSpeakerLabel(speaker) {
         const labels = {
             'user': 'You',
-            'refined': 'Refined Prompt',
-            'hermes_raw': 'Hermes Response',
-            'distilled': 'Summary',
-            'system': 'System',
-            'error': 'Error'
+            'intermediary': 'Refined',
+            'hermes_raw': 'Hermes',
+            'agent_speaking': 'Answer',
+            'system': 'System'
         };
         return labels[speaker] || speaker;
     }
@@ -87,37 +91,30 @@
     function formatTimestamp(ts) {
         if (!ts) return '';
         try {
-            const d = new Date(ts);
+            const d = new Date(ts * 1000);
             return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         } catch {
             return '';
         }
     }
 
-    function appendMessage(speaker, text, timestamp) {
-        if (!text && text !== 0) return;
-        const el = createMessageElement(speaker, String(text), timestamp);
+    function appendMessage(data) {
+        const el = createMessageElement(data);
         transcriptEl.appendChild(el);
         scrollToBottom();
     }
 
     function scrollToBottom() {
         const container = document.querySelector('.transcript-container');
-        if (container) {
-            container.scrollTop = container.scrollHeight;
-        }
+        if (container) container.scrollTop = container.scrollHeight;
     }
 
-    // --- Typing indicator ---
-
-    function showTypingIndicator() {
-        const existing = document.querySelector('.typing-indicator');
-        if (existing) return;
-
+    function showTypingIndicator(text) {
+        hideTypingIndicator();
         const indicator = document.createElement('div');
         indicator.className = 'typing-indicator';
         indicator.id = 'typing-indicator';
-        indicator.innerHTML = '<span></span><span></span><span></span>';
+        indicator.innerHTML = `<span></span><span></span><span></span><em>${text || 'Hermes is thinking...'}</em>`;
         transcriptEl.appendChild(indicator);
         scrollToBottom();
     }
@@ -127,29 +124,22 @@
         if (indicator) indicator.remove();
     }
 
-    // --- SSE Connection ---
-
     function connectSSE(streamId) {
-        // Close existing connection
-        if (eventSource) {
-            eventSource.close();
-            eventSource = null;
-        }
+        if (eventSource) eventSource.close();
 
         currentStreamId = streamId;
         const url = `/api/chat/stream?stream_id=${encodeURIComponent(streamId)}`;
 
-        setStatus(true, 'Streaming...');
+        showTypingIndicator();
 
         eventSource = new EventSource(url);
 
-        eventSource.onopen = () => {
-            reconnectAttempts = 0;
-        };
+        eventSource.onopen = () => reconnectAttempts = 0;
 
         eventSource.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
+                hideTypingIndicator();
                 handleStreamEvent(data);
             } catch (e) {
                 console.error('Failed to parse SSE message:', event.data, e);
@@ -157,70 +147,46 @@
         };
 
         eventSource.onerror = (err) => {
-            console.error('SSE error:', err);
             hideTypingIndicator();
-
-            if (eventSource.readyState === EventSource.CLOSED) {
-                setStatus(false, 'Stream ended');
-            } else {
-                setStatus(false, 'Connection error');
-            }
-
-            // Auto-reconnect logic (only on transient errors, not normal close)
-            eventSource.close();
+            if (eventSource) eventSource.close();
             eventSource = null;
-
-            // SSE onerror fires on normal close too — only reconnect if we didn't get "done"
-            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && currentStreamId && isProcessing) {
+            
+            if (isProcessing && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                 reconnectAttempts++;
-                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 3000);
-                setStatus(false, `Reconnecting (${reconnectAttempts})...`);
                 setTimeout(() => {
                     if (currentStreamId && isProcessing) connectSSE(currentStreamId);
-                }, delay);
-            } else {
-                setStatus(false, 'Ready');
-                isProcessing = false;
-                updateUI();
+                }, 1000);
             }
         };
     }
 
     function handleStreamEvent(data) {
-        const { speaker, text, timestamp, emotion } = data;
+        const { speaker, text, is_reasoning, is_answer } = data;
 
-        // Handle special events
-        if (speaker === 'system') {
-            if (text === 'stream_start') {
-                showTypingIndicator();
-                return;
-            }
-            if (text === 'stream_end' || text === 'done') {
-                hideTypingIndicator();
-                setStatus(true, 'Connected');
-                isProcessing = false;
-                updateUI();
-                return;
-            }
-            if (text === 'error') {
-                hideTypingIndicator();
-                appendMessage('error', data.error || 'An error occurred', timestamp);
-                isProcessing = false;
-                updateUI();
-                return;
-            }
-            appendMessage('system', text, timestamp);
+        if (speaker === 'system' && text === 'done') {
+            hideTypingIndicator();
+            setStatus(false, 'Connected');
+            isProcessing = false;
+            updateUI();
             return;
         }
 
-        // Hide typing indicator on first real content
         hideTypingIndicator();
+        
+        // Show "Hermes is thinking..." next time around
+        if (is_reasoning) {
+            appendMessage(data);
+            showTypingIndicator();
+            return;
+        }
 
-        // Render the message
-        appendMessage(speaker, text, timestamp);
+        if (is_answer) {
+            appendMessage(data);
+            return;
+        }
+
+        appendMessage(data);
     }
-
-    // --- Initialize session (for real Hermes) ---
 
     async function initSession() {
         try {
@@ -231,19 +197,12 @@
                 authCookie = data.cookie;
                 useRealHermes = true;
                 setStatus(false, 'Ready (Real Hermes)');
-                console.log('Real Hermes session:', sessionId);
-            } else {
-                // Fall back to mock
-                useRealHermes = false;
-                setStatus(false, 'Ready (Mock)');
+                return;
             }
-        } catch (e) {
-            useRealHermes = false;
-            setStatus(false, 'Ready (Mock)');
-        }
+        } catch (e) {}
+        useRealHermes = false;
+        setStatus(false, 'Ready (Demo)');
     }
-
-    // --- Send message ---
 
     async function sendMessage() {
         const text = inputEl.value.trim();
@@ -252,15 +211,12 @@
         isProcessing = true;
         updateUI();
 
-        // Show user message immediately
-        appendMessage('user', text, new Date().toISOString());
+        appendMessage({ speaker: 'user', text: text, timestamp: Date.now() / 1000 });
         inputEl.value = '';
-        autoResize();
+        inputEl.style.height = 'auto';
 
         try {
             const body = { message: text };
-            
-            // Include session_id and cookie for real Hermes
             if (useRealHermes && sessionId && authCookie) {
                 body.session_id = sessionId;
                 body.cookie = authCookie;
@@ -272,101 +228,48 @@
                 body: JSON.stringify(body)
             });
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
             const data = await response.json();
-            
-            // Handle error response
-            if (data.error) {
-                throw new Error(data.error);
-            }
-            
-            const streamId = data.stream_id;
+            if (data.error) throw new Error(data.error);
 
-            if (!streamId) {
-                throw new Error('No stream_id received from server');
-            }
-
-            connectSSE(streamId);
+            connectSSE(data.stream_id);
         } catch (err) {
-            console.error('Failed to send message:', err);
             hideTypingIndicator();
-            appendMessage('error', `Failed to send: ${err.message}`, new Date().toISOString());
+            appendMessage({ speaker: 'error', text: `Failed: ${err.message}`, timestamp: Date.now() / 1000 });
             isProcessing = false;
             updateUI();
-            setStatus(false, 'Error');
         }
     }
-
-    // --- UI state ---
 
     function updateUI() {
         sendBtn.disabled = isProcessing;
         inputEl.disabled = isProcessing;
-        if (!isProcessing) {
-            inputEl.focus();
-        }
+        if (!isProcessing) inputEl.focus();
     }
-
-    function autoResize() {
-        inputEl.style.height = 'auto';
-        inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
-    }
-
-    // --- Demo mode ---
 
     function fillDemoText() {
-        const samples = [
-            "What's the weather like today?",
-            "Tell me a joke about programming",
-            "How do I make a perfect cup of coffee?",
-            "Explain quantum computing in simple terms",
-            "What are the best practices for writing clean code?"
-        ];
-        const sample = samples[Math.floor(Math.random() * samples.length)];
-        inputEl.value = sample;
-        autoResize();
+        const samples = ["What's the weather like?", "Tell me a joke about programming"];
+        inputEl.value = samples[Math.floor(Math.random() * samples.length)];
         inputEl.focus();
     }
-
-    // --- Event listeners ---
 
     sendBtn.addEventListener('click', sendMessage);
-
     inputEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage();
-        }
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
     });
-
-    inputEl.addEventListener('input', autoResize);
-
     demoBtn.addEventListener('click', fillDemoText);
 
-    // --- Initialize ---
-
-    function init() {
-        setStatus(false, 'Connecting...');
-        updateUI();
-        inputEl.focus();
-
-        // Add welcome message
-        appendMessage('system', 'Welcome! Initializing...', new Date().toISOString());
-
-        // Initialize session (tries real Hermes, falls back to mock)
-        initSession().then(() => {
-            // Replace welcome message
-            const firstMsg = transcriptEl.querySelector('.message.system');
-            if (firstMsg) firstMsg.remove();
-            appendMessage('system', useRealHermes 
-                ? 'Connected to Real Hermes. Type a message to begin.' 
-                : 'Running in demo mode (mock Hermes). Type a message to begin.', 
-                new Date().toISOString());
+    setStatus(false, 'Connecting...');
+    appendMessage({ speaker: 'system', text: 'Initializing...', timestamp: Date.now() / 1000 });
+    
+    initSession().then(() => {
+        const firstMsg = transcriptEl.querySelector('.message.system');
+        if (firstMsg) firstMsg.remove();
+        appendMessage({ 
+            speaker: 'system', 
+            text: useRealHermes ? 'Connected to Real Hermes.' : 'Running in demo mode.', 
+            timestamp: Date.now() / 1000 
         });
-    }
-
-    init();
+    });
 })();

@@ -1,16 +1,8 @@
-"""TextIntermediary — the core text-only MVP.
-
-Wires together:
-- Refinement (system prompt / placeholder)
-- HermesClient (HTTP/SSE to Hermes API)
-- DistillationBuffer (sentence boundary detection)
-- distill() (rewrite for speech)
-
-Yields IntermediaryEvent objects for any consumer (FastAPI SSE, CLI, etc.)
-"""
+"""TextIntermediary — core text MVP."""
 
 import asyncio
 import logging
+import re
 import time
 from typing import AsyncIterable, Optional
 
@@ -23,15 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class TextIntermediary:
-    """
-    Text-only intermediary — no LiveKit, no voice.
-    
-    Usage:
-        intermediary = TextIntermediary(hermes_client, session_id="ses-123")
-        async for event in intermediary.chat("um the docker thing?"):
-            print(event.speaker, event.text)
-    """
-    
     def __init__(
         self,
         hermes_client: HermesClient,
@@ -43,17 +26,14 @@ class TextIntermediary:
     
     async def chat(self, message: str, stream_id: Optional[str] = None) -> AsyncIterable[IntermediaryEvent]:
         """
-        Process a user message through the full pipeline.
+        Streaming strategy:
+        1. Refine input
+        2. Accumulate Hermes SSE deltas into sentences
+        3. Emit each sentence as HERMES reasoning (visible in UI)
+        4. After stream completes, distill ALL accumulated text
+        5. Emit the distilled answer as AGENT_SPEAKING (final answer)
         
-        Args:
-            message: Raw user input
-            stream_id: If provided, use this stream_id instead of starting a new chat
-            
-        Yields:
-        - refined: the clarified user input
-        - hermes_raw: the full Hermes response (accumulated)
-        - distilled: each distilled sentence
-        - done: when Hermes finishes
+        This gives transparency — user sees both reasoning AND a clean final summary.
         """
         timestamp = time.time()
         
@@ -62,7 +42,7 @@ class TextIntermediary:
             try:
                 self.session_id = await self.hermes.create_session()
             except Exception:
-                pass  # Mock might not have create_session
+                pass
         
         # 1. Refine
         refined = self._refine(message)
@@ -73,59 +53,56 @@ class TextIntermediary:
             emotion=Emotion.THINKING,
         )
         
-        # 2. Start Hermes run (or use provided stream_id)
+        # 2. Start Hermes run
         if stream_id is None:
             stream_id = await self.hermes.start_chat(refined, self.session_id)
         
-        # 3. Stream Hermes response → buffer → distill
+        # 3. Stream Hermes response → emit reasoning sentences as they come
         buffer = DistillationBuffer()
         hermes_full_text = ""
         
         async for delta in self.hermes.stream_chat(stream_id):
-            # Check for barge-in
             if self._barge_in_sm.should_drop_delta():
                 continue
             
             hermes_full_text += delta
             
-            # Buffer and check for sentence boundary
+            # Emit each sentence as HERMES reasoning
             sentence = buffer.feed(delta)
             if sentence:
-                # Yield the raw Hermes text
                 yield IntermediaryEvent(
                     speaker=Speaker.HERMES,
                     text=sentence,
                     timestamp=time.time(),
+                    emotion=Emotion.THINKING,
+                    is_reasoning=True,
                 )
-                
-                # Distill and yield
-                distilled = await distill(sentence)
-                if distilled:
-                    yield IntermediaryEvent(
-                        speaker=Speaker.AGENT_SPEAKING,
-                        text=distilled,
-                        timestamp=time.time(),
-                        emotion=Emotion.NEUTRAL,
-                    )
         
         # Flush remaining buffer
         final = buffer.flush()
         if final:
+            hermes_full_text += " " + final
             yield IntermediaryEvent(
                 speaker=Speaker.HERMES,
                 text=final,
                 timestamp=time.time(),
+                emotion=Emotion.THINKING,
+                is_reasoning=True,
             )
-            distilled = await distill(final)
-            if distilled:
-                yield IntermediaryEvent(
-                    speaker=Speaker.AGENT_SPEAKING,
-                    text=distilled,
-                    timestamp=time.time(),
-                    emotion=Emotion.NEUTRAL,
-                )
         
-        # 4. Done
+        # 4. Distill the full response → emit as final answer
+        distilled = await distill(hermes_full_text)
+        
+        if distilled:
+            yield IntermediaryEvent(
+                speaker=Speaker.AGENT_SPEAKING,
+                text=distilled,
+                timestamp=time.time(),
+                emotion=Emotion.NEUTRAL,
+                is_answer=True,
+            )
+        
+        # 5. Done
         self._barge_in_sm.on_hermes_finish()
         yield IntermediaryEvent(
             speaker=Speaker.SYSTEM,
@@ -134,17 +111,13 @@ class TextIntermediary:
         )
     
     async def steer(self, text: str) -> dict:
-        """Inject steer into active Hermes run."""
         self._barge_in_sm.on_user_speech(text)
         result = await self.hermes.steer(self.session_id, text)
         return result
     
     def _refine(self, text: str) -> str:
-        """Refine messy input. Phase 1: placeholder. Phase 1.3+: LLM call."""
         import re
-        # Remove consecutive filler words from the start (greedy)
         pattern = re.compile(r'^(?:(?:um+|so+|like+|you know+)\s*)+', flags=re.IGNORECASE)
         refined = pattern.sub('', text)
-        # Remove leading comma if present
         refined = re.sub(r'^,\s*', '', refined)
         return refined.strip() or text.strip()

@@ -27,6 +27,8 @@ class IntermediaryEvent:
     emotion: Optional[str] = None
     audio: Optional[bytes] = None
     generation: int = 0
+    is_reasoning: bool = False
+    is_answer: bool = False
     
     def to_dict(self) -> dict:
         return {
@@ -34,4 +36,6 @@ class IntermediaryEvent:
             "text": self.text,
             "timestamp": self.timestamp,
             "emotion": self.emotion,
+            "is_reasoning": self.is_reasoning,
+            "is_answer": self.is_answer,
         }

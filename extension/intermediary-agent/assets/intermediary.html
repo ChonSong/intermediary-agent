@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Intermediary — Text MVP</title>
+    <style>
+        :root {
+            --bg: #0e0e0f;
+            --surface: #18181a;
+            --surface-strong: #222326;
+            --text: #d7d7d7;
+            --muted: #cccccc;
+            --accent: #00b894;
+            --accent-bg: rgba(0, 184, 148, 0.12);
+            --border: rgba(255, 255, 255, 0.08);
+            --user-bubble: #0a84ff;
+            --user-text: #ffffff;
+            --intermediary-bubble: #1a3a2a;
+            --intermediary-border: #00b894;
+            --hermes-bubble: #1c1c1e;
+            --hermes-border: rgba(255, 255, 255, 0.1);
+            --answer-bubble: #0b2a1f;
+            --answer-border: #00b894;
+            --system-text: #888888;
+            --error-bubble: #3a1a1a;
+            --error-border: #ff4444;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+            transition: background-color 0.3s;
+        }
+
+        .header-dot.connected { background: var(--accent); }
+        .header-dot.error { background: var(--error-border); }
+
+        .header-title {
+            font-weight: 600;
+            color: var(--accent);
+            font-size: 15px;
+        }
+
+        .header-status {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        /* ── Session Bar ── */
+        .session-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--surface-strong);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .session-bar select {
+            flex: 1;
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 12px;
+            max-width: 300px;
+        }
+
+        .session-bar button {
+            background: var(--accent-bg);
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .session-bar button:hover {
+            background: rgba(0, 184, 148, 0.2);
+        }
+
+        .session-bar button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* ── Messages ── */
+        .transcript {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .message {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-width: 85%;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.user {
+            align-self: flex-end;
+            align-items: flex-end;
+        }
+
+        .message.intermediary,
+        .message.hermes_raw,
+        .message.agent_speaking,
+        .message.system,
+        .message.error {
+            align-self: flex-start;
+            align-items: flex-start;
+        }
+
+        .message-content {
+            padding: 8px 12px;
+            border-radius: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message.user .message-content {
+            background: var(--user-bubble);
+            color: var(--user-text);
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.intermediary .message-content {
+            background: var(--intermediary-bubble);
+            border: 1px solid var(--intermediary-border);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.hermes_raw .message-content {
+            background: var(--hermes-bubble);
+            border: 1px solid var(--hermes-border);
+            border-bottom-left-radius: 4px;
+            font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+            font-size: 13px;
+        }
+
+        .message.agent_speaking .message-content {
+            background: var(--answer-bubble);
+            border: 1px solid var(--answer-border);
+            border-bottom-left-radius: 4px;
+            font-weight: 500;
+        }
+
+        .message.system .message-content {
+            background: transparent;
+            color: var(--system-text);
+            font-size: 12px;
+            padding: 4px 8px;
+        }
+
+        .message.error .message-content {
+            background: var(--error-bubble);
+            border: 1px solid var(--error-border);
+            border-bottom-left-radius: 4px;
+        }
+
+        /* ── Labels ── */
+        .message-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .message.user .message-label { color: var(--user-bubble); }
+        .message.intermediary .message-label { color: var(--intermediary-border); }
+        .message.hermes_raw .message-label { color: var(--muted); }
+        .message.agent_speaking .message-label { color: var(--accent); }
+        .message.system .message-label { color: var(--system-text); }
+        .message.error .message-label { color: var(--error-border); }
+
+        /* ── Timestamp ── */
+        .message-timestamp {
+            font-size: 10px;
+            color: var(--muted);
+            padding: 0 4px;
+        }
+
+        /* ── Composer ── */
+        .composer {
+            display: flex;
+            align-items: flex-end;
+            gap: 8px;
+            padding: 12px 16px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .composer-input-wrap {
+            flex: 1;
+            position: relative;
+        }
+
+        .composer-input {
+            width: 100%;
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 14px;
+            resize: none;
+            outline: none;
+            max-height: 120px;
+            font-family: inherit;
+            line-height: 1.5;
+        }
+
+        .composer-input:focus {
+            border-color: var(--accent);
+        }
+
+        .composer-input::placeholder {
+            color: #cccccc;
+        }
+
+        .composer-send {
+            background: var(--accent);
+            color: var(--bg);
+            border: none;
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .composer-send:hover { opacity: 0.9; }
+        .composer-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ── Typing indicator ── */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 8px 12px;
+            background: var(--surface-strong);
+            border-radius: 12px;
+            border-bottom-left-radius: 4px;
+            align-self: flex-start;
+        }
+
+        .typing-indicator .dot {
+            width: 6px;
+            height: 6px;
+            background: var(--accent);
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+
+        .typing-indicator .dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator .dot:nth-child(3) { animation-delay: 0.4s; }
+        .typing-indicator .dot:nth-child(4) {
+            animation-delay: 0.6s;
+            font-style: italic;
+            font-size: 11px;
+            color: var(--muted);
+            background: transparent;
+            width: auto;
+            height: auto;
+        }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(1); opacity: 0.5; }
+            40% { transform: scale(1.3); opacity: 1; }
+        }
+
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <div class="header-dot" id="statusDot"></div>
+            <span class="header-title">Intermediary</span>
+        </div>
+        <div class="header-status" id="statusText">Initializing...</div>
+    </div>
+
+    <!-- Session Bar -->
+    <div class="session-bar">
+        <select id="sessionSelect">
+            <option value="">Loading sessions...</option>
+        </select>
+        <button id="refreshSessions" title="Refresh session list">↻</button>
+        <button id="newSessionBtn" title="Create new session">+ New</button>
+    </div>
+
+    <!-- Transcript -->
+    <div class="transcript" id="transcript"></div>
+
+    <!-- Composer -->
+    <div class="composer">
+        <div class="composer-input-wrap">
+            <textarea 
+                class="composer-input" 
+                id="composerInput" 
+                placeholder="Type a message... (Enter to send)" 
+                rows="1"
+            ></textarea>
+        </div>
+        <button class="composer-send" id="composerSend">Send</button>
+    </div>
+
+    <script>
+    (function() {
+        'use strict';
+
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const sessionSelect = document.getElementById('sessionSelect');
+        const refreshSessionsBtn = document.getElementById('refreshSessions');
+        const newSessionBtn = document.getElementById('newSessionBtn');
+        const transcript = document.getElementById('transcript');
+        const composerInput = document.getElementById('composerInput');
+        const composerSendBtn = document.getElementById('composerSend');
+
+        let eventSource = null;
+        let currentStreamId = null;
+        let isProcessing = false;
+        let authCookie = null;
+
+        function setStatus(text, connected) {
+            statusText.textContent = text;
+            statusDot.classList.toggle('connected', connected);
+            statusDot.classList.toggle('error', !connected);
+        }
+
+        async function initApp() {
+            setStatus('Connecting...', false);
+
+            // Get cookie from hermes storage
+            try {
+                const resp = await fetch('/api/hermes-cookie');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    authCookie = data.cookie;
+                    setStatus('Ready', true);
+                    await loadSessions();
+                } else {
+                    throw new Error('No cookie');
+                }
+            } catch (e) {
+                setStatus('No Hermes access — login to Hermes Agent first', false);
+            }
+        }
+
+        async function loadSessions() {
+            try {
+                const resp = await fetch('/api/sessions');
+                if (!resp.ok) throw new Error('Failed');
+
+                const data = await resp.json();
+                sessionSelect.innerHTML = '';
+
+                if (!data.sessions || data.sessions.length === 0) {
+                    sessionSelect.innerHTML = '<option value="">No active sessions — create one</option>';
+                    return;
+                }
+
+                data.sessions.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.session_id;
+                    opt.textContent = `${s.title || 'Untitled'} (${s.message_count || 0} messages)`;
+                    sessionSelect.appendChild(opt);
+                });
+
+            } catch (e) {
+                sessionSelect.innerHTML = '<option value="">Could not load sessions</option>';
+            }
+        }
+
+        async function createSession() {
+            try {
+                const resp = await fetch('/api/session', { method: 'POST' });
+                if (!resp.ok) throw new Error('Failed');
+                const data = await resp.json();
+                await loadSessions();
+                sessionSelect.value = data.session_id;
+            } catch (e) {
+                setStatus('Could not create session', false);
+            }
+        }
+
+        function appendMessage(data) {
+            const speaker = data.speaker;
+            const text = data.text;
+            const timestamp = data.timestamp;
+            const isReasoning = data.is_reasoning;
+            const isAnswer = data.is_answer;
+
+            const wrap = document.createElement('div');
+            wrap.className = `message ${speaker}`;
+
+            const label = document.createElement('div');
+            label.className = 'message-label';
+            const labels = {
+                user: 'You', intermediary: 'Intermediary', hermes_raw: 'Hermes',
+                agent_speaking: 'Intermediary Answer', system: 'System', error: 'Error'
+            };
+            label.textContent = labels[speaker] || speaker;
+            wrap.appendChild(label);
+
+            const content = document.createElement('div');
+            content.className = 'message-content';
+            content.textContent = text;
+            wrap.appendChild(label);
+            wrap.appendChild(content);
+
+            if (timestamp) {
+                const ts = document.createElement('div');
+                ts.className = 'message-timestamp';
+                const d = new Date(Math.floor(timestamp * 1000));
+                ts.textContent = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+                wrap.appendChild(ts);
+            }
+
+            transcript.appendChild(wrap);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        function showTyping(text) {
+            removeTyping();
+            const wrap = document.createElement('div');
+            wrap.className = 'typing-indicator';
+            wrap.id = 'typingIndicator';
+            for (let i = 0; i < 4; i++) {
+                const dot = document.createElement('span');
+                dot.className = 'dot';
+                if (i === 3) {
+                    dot.textContent = text || 'Hermes is thinking...';
+                    dot.style.animation = 'none';
+                }
+                wrap.appendChild(dot);
+            }
+            transcript.appendChild(wrap);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        function removeTyping() {
+            const t = document.getElementById('typingIndicator');
+            if (t) t.remove();
+        }
+
+        function connectSSE(streamId) {
+            if (eventSource) eventSource.close();
+
+            currentStreamId = streamId;
+            const url = `/api/chat/stream?stream_id=${encodeURIComponent(streamId)}`;
+
+            showTyping();
+
+            eventSource = new EventSource(url);
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    removeTyping();
+                    handleStreamEvent(data);
+                } catch (e) {}
+            };
+
+            eventSource.onerror = () => {
+                removeTyping();
+                if (eventSource) eventSource.close();
+                eventSource = null;
+            };
+        }
+
+        function handleStreamEvent(data) {
+            const { speaker, text, is_reasoning, is_answer } = data;
+
+            if (speaker === 'system' && text === 'done') {
+                removeTyping();
+                isProcessing = false;
+                composerSendBtn.disabled = false;
+                composerInput.disabled = false;
+                composerInput.focus();
+                return;
+            }
+
+            removeTyping();
+
+            appendMessage(data);
+
+            // Show typing after reasoning to indicate more is coming
+            if (is_reasoning) showTyping();
+        }
+
+        async function sendMessage() {
+            const text = composerInput.value.trim();
+            if (!text || isProcessing) return;
+
+            isProcessing = true;
+            composerSendBtn.disabled = true;
+            composerInput.disabled = true;
+
+            appendMessage({ speaker: 'user', text: text, timestamp: Date.now() / 1000 });
+            composerInput.value = '';
+            composerInput.style.height = 'auto';
+
+            const sessionId = sessionSelect.value;
+            if (!sessionId) {
+                appendMessage({ speaker: 'error', text: 'No session selected', timestamp: Date.now() / 1000 });
+                isProcessing = false;
+                composerSendBtn.disabled = false;
+                composerInput.disabled = false;
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: text,
+                        session_id: sessionId,
+                    })
+                });
+
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+
+                connectSSE(data.stream_id);
+            } catch (err) {
+                removeTyping();
+                appendMessage({ speaker: 'error', text: `Failed: ${err.message}`, timestamp: Date.now() / 1000 });
+                isProcessing = false;
+                composerSendBtn.disabled = false;
+                composerInput.disabled = false;
+            }
+        }
+
+        // Event listeners
+        composerSendBtn.addEventListener('click', sendMessage);
+        composerInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        composerInput.addEventListener('input', () => {
+            composerInput.style.height = 'auto';
+            composerInput.style.height = Math.min(composerInput.scrollHeight, 120) + 'px';
+        });
+
+        refreshSessionsBtn.addEventListener('click', loadSessions);
+        newSessionBtn.addEventListener('click', createSession);
+
+        initApp();
+    })();
+    </script>
+</body>
+</html>

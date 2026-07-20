@@ -1,0 +1,15 @@
+{
+  "id": "intermediary-agent",
+  "name": "Intermediary Agent",
+  "description": "Live voice intermediary panel for Hermes WebUI",
+  "scripts": ["assets/extension.js"],
+  "stylesheets": ["assets/extension.css"],
+  "permissions": {
+    "storage": {"owned": true}
+  },
+  "sidecar": {
+    "type": "loopback",
+    "origin": "http://127.0.0.1:8080",
+    "health_path": "/api/health"
+  }
+}

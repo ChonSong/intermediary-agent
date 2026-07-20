@@ -90,8 +90,8 @@ class TextIntermediary:
                 is_reasoning=True,
             )
         
-        # 4. Distill the full response → emit as final answer
-        distilled = await distill(hermes_full_text)
+        # 4. Distill the full response
+        distilled = distill(hermes_full_text)
         
         if distilled:
             yield IntermediaryEvent(
